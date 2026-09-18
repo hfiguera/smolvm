@@ -2172,6 +2172,7 @@ pub(crate) fn prepare_forks_reusing(
     source_policy: ForkSourcePolicy,
 ) -> Result<PreparedForkBatch> {
     let preparation_started = std::time::Instant::now();
+    db.require_completed_resize(golden)?;
     if specs.is_empty() {
         return Err(Error::config("fork", "at least one clone is required"));
     }
