@@ -65,7 +65,6 @@ impl ForkSourceLock {
         Ok(Self { _file: file })
     }
 
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
     fn try_acquire_at(path: &Path) -> Result<Option<Self>> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
@@ -105,7 +104,7 @@ pub(crate) fn lock_saved_execution(source: &str) -> Result<ForkSourceLock> {
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-fn try_lock_fork_source(source: &str) -> Result<Option<ForkSourceLock>> {
+pub(crate) fn try_lock_fork_source(source: &str) -> Result<Option<ForkSourceLock>> {
     validate_vm_name(source, "fork source").map_err(|error| Error::config("fork source", error))?;
     ForkSourceLock::try_acquire_at(&fork_source_lock_path(source))
 }
@@ -214,7 +213,13 @@ fn try_lock_file_exclusive(file: &File) -> std::io::Result<()> {
     if result != 0 {
         Ok(())
     } else {
-        Err(std::io::Error::last_os_error())
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() == Some(windows_sys::Win32::Foundation::ERROR_LOCK_VIOLATION as i32)
+        {
+            Err(std::io::Error::new(std::io::ErrorKind::WouldBlock, error))
+        } else {
+            Err(error)
+        }
     }
 }
 
