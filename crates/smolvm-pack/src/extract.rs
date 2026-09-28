@@ -2034,6 +2034,10 @@ struct ArtifactSourceIdentity {
     inode: Option<(u64, u64, i64, i64)>,
     #[serde(default)]
     locally_produced: bool,
+    /// The digest came from a full read of this inode, during which only the
+    /// service could write it and its identity did not change.
+    #[serde(default)]
+    hashed_while_service_only: bool,
 }
 
 impl ArtifactSourceIdentity {
@@ -2041,6 +2045,18 @@ impl ArtifactSourceIdentity {
         self.inode
             .zip(other.inode)
             .is_some_and(|(a, b)| a.0 == b.0 && a.1 == b.1)
+    }
+
+    /// Whether this record's full-read digest still describes `other`: the
+    /// same inode, unchanged (length, mtime and kernel-maintained ctime).
+    /// The caller must also confirm only the service can write it now.
+    fn covers_hashed(&self, other: &Self) -> bool {
+        self.hashed_while_service_only
+            && self.inode.is_some()
+            && self.inode == other.inode
+            && self.len == other.len
+            && self.modified_secs == other.modified_secs
+            && self.modified_nanos == other.modified_nanos
     }
 
     fn covers_local(&self, other: &Self) -> bool {
@@ -2071,6 +2087,47 @@ fn service_owned_artifact(path: &Path) -> bool {
             && file.mode() & 0o077 == 0
             && parent.is_dir()
             && parent.uid() == 0
+            && parent.mode() & 0o022 == 0
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        false
+    }
+}
+
+/// Whether only the service principal can change `path`'s bytes: a regular
+/// file (not a symlink) owned by root or by the uid this process runs as, not
+/// group- or world-writable, in a directory with the same properties.
+///
+/// Then an unchanged identity (inode, length, mtime and the kernel-maintained
+/// ctime) means unchanged bytes: nobody else can write the file, relink it or
+/// replace it. This lets a full verification of the file be reused. Readable
+/// permissions are irrelevant here; only who can write matters.
+pub fn only_service_can_write(path: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let service = |uid: u32| uid == 0 || uid == unsafe { libc::geteuid() };
+        let Ok(file) = fs::symlink_metadata(path) else {
+            return false;
+        };
+        let Some(parent) = path.parent() else {
+            return false;
+        };
+        let parent = if parent.as_os_str().is_empty() {
+            Path::new(".")
+        } else {
+            parent
+        };
+        let Ok(parent) = fs::metadata(parent) else {
+            return false;
+        };
+        file.is_file()
+            && service(file.uid())
+            && file.mode() & 0o022 == 0
+            && parent.is_dir()
+            && service(parent.uid())
             && parent.mode() & 0o022 == 0
     }
     #[cfg(not(unix))]
@@ -2115,6 +2172,7 @@ fn artifact_metadata_identity(
         #[cfg(not(unix))]
         inode: None,
         locally_produced: false,
+        hashed_while_service_only: false,
     }
 }
 
@@ -2343,6 +2401,7 @@ fn ensure_shared_artifact_sha256_with_identity(
     lock_file_exclusive(&lock_file)?;
 
     let source_path = shared_artifact_source_path(shared_dir);
+    let trusted_before = only_service_can_write(sidecar_path);
     let mut source_identity = artifact_source_identity(sidecar_path)?;
     if digest_path.exists() {
         let cached_digest = read_shared_artifact_sha256(shared_dir)?;
@@ -2353,6 +2412,16 @@ fn ensure_shared_artifact_sha256_with_identity(
             && cached_source
                 .as_ref()
                 .is_some_and(|cached| cached.covers_local(&source_identity))
+        {
+            return Ok(cached_digest);
+        }
+        // A warm create from the same unchanged pack that only the service can
+        // write reuses the digest of its earlier full read, instead of hashing
+        // the whole pack again (and serializing concurrent creates on this lock).
+        if only_service_can_write(sidecar_path)
+            && cached_source
+                .as_ref()
+                .is_some_and(|cached| cached.covers_hashed(&source_identity))
         {
             return Ok(cached_digest);
         }
@@ -2379,6 +2448,8 @@ fn ensure_shared_artifact_sha256_with_identity(
             && cached_source.as_ref().is_some_and(|cached| {
                 cached.locally_produced && cached.same_inode(&source_identity)
             });
+        source_identity.hashed_while_service_only =
+            hashed_while_service_only(sidecar_path, &source_identity, trusted_before)?;
         write_atomic_marker(
             &source_path,
             &serde_json::to_vec(&source_identity)
@@ -2392,7 +2463,12 @@ fn ensure_shared_artifact_sha256_with_identity(
         written_digest.is_some() && service_owned_artifact(sidecar_path);
     let digest = match written_digest {
         Some(digest) => digest.to_owned(),
-        None => hash_artifact_sha256(sidecar_path)?,
+        None => {
+            let digest = hash_artifact_sha256(sidecar_path)?;
+            source_identity.hashed_while_service_only =
+                hashed_while_service_only(sidecar_path, &source_identity, trusted_before)?;
+            digest
+        }
     };
     write_atomic_marker(&digest_path, format!("{digest}\n").as_bytes())?;
     write_atomic_marker(
@@ -2401,6 +2477,24 @@ fn ensure_shared_artifact_sha256_with_identity(
             .map_err(|error| std::io::Error::other(error.to_string()))?,
     )?;
     Ok(digest)
+}
+
+/// Whether a full read of `sidecar_path` just finished with only the service
+/// able to write it throughout, and with its identity unchanged since `before`.
+fn hashed_while_service_only(
+    sidecar_path: &Path,
+    before: &ArtifactSourceIdentity,
+    trusted_before: bool,
+) -> std::io::Result<bool> {
+    if !trusted_before || !only_service_can_write(sidecar_path) {
+        return Ok(false);
+    }
+    let after = artifact_source_identity(sidecar_path)?;
+    Ok(before.inode.is_some()
+        && before.inode == after.inode
+        && before.len == after.len
+        && before.modified_secs == after.modified_secs
+        && before.modified_nanos == after.modified_nanos)
 }
 
 /// Set a directory to `0700` (owner-only) if possible. Best-effort; errors are
@@ -4283,6 +4377,7 @@ mod tests {
             modified_nanos: Some(20),
             inode: Some((1, 2, 30, 40)),
             locally_produced: true,
+            hashed_while_service_only: false,
         };
         let mut alias = super::ArtifactSourceIdentity {
             canonical_path: "restore".into(),
@@ -4702,18 +4797,89 @@ mod tests {
         assert!(!identity.covers_local(&identity));
     }
 
+    /// A private pack (only the service can write it) that is unchanged since
+    /// its full read reuses that digest instead of hashing the pack again: a
+    /// warm create from a large pack must not read the whole pack (#1454).
+    #[cfg(unix)]
     #[test]
-    fn an_unchanged_external_artifact_still_requires_digest_verification() {
+    fn an_unchanged_private_artifact_reuses_its_full_read_digest() {
+        use std::os::unix::fs::PermissionsExt;
         let temp = tempfile::tempdir().unwrap();
+        fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o755)).unwrap();
         let shared = temp.path().join("shared");
         fs::create_dir(&shared).unwrap();
         let artifact = temp.path().join("download");
         fs::write(&artifact, b"downloaded bytes").unwrap();
+        fs::set_permissions(&artifact, fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(only_service_can_write(&artifact));
+        let digest = ensure_shared_artifact_sha256(&artifact, &shared).unwrap();
+        // Proof that the second call reads no bytes: a digest the bytes no
+        // longer match is returned as is, because the file cannot have changed.
+        fs::write(shared_artifact_sha256_path(&shared), "0".repeat(64)).unwrap();
+        assert_eq!(
+            ensure_shared_artifact_sha256(&artifact, &shared).unwrap(),
+            "0".repeat(64)
+        );
+        fs::write(shared_artifact_sha256_path(&shared), format!("{digest}\n")).unwrap();
+        // Any write moves ctime, so the reuse ends and the bytes are read again.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        fs::write(&artifact, b"different bytes!").unwrap();
+        assert!(ensure_shared_artifact_sha256(&artifact, &shared).is_err());
+    }
+
+    /// A pack someone other than the service can write must be read in full
+    /// every time: its bytes can change without its identity changing.
+    #[cfg(unix)]
+    #[test]
+    fn an_artifact_others_can_write_still_requires_digest_verification() {
+        use std::os::unix::fs::PermissionsExt;
+        for (file_mode, dir_mode) in [(0o666, 0o755), (0o644, 0o777)] {
+            let temp = tempfile::tempdir().unwrap();
+            fs::set_permissions(temp.path(), fs::Permissions::from_mode(dir_mode)).unwrap();
+            let shared = temp.path().join("shared");
+            fs::create_dir(&shared).unwrap();
+            let artifact = temp.path().join("download");
+            fs::write(&artifact, b"downloaded bytes").unwrap();
+            fs::set_permissions(&artifact, fs::Permissions::from_mode(file_mode)).unwrap();
+            assert!(!only_service_can_write(&artifact));
+            ensure_shared_artifact_sha256(&artifact, &shared).unwrap();
+            fs::write(shared_artifact_sha256_path(&shared), "0".repeat(64)).unwrap();
+            assert!(ensure_shared_artifact_sha256(&artifact, &shared).is_err());
+        }
+    }
+
+    /// A digest from a read that happened while others could write the pack
+    /// is never reused, even after the pack becomes private: a writer that
+    /// already held it open can still change it.
+    #[cfg(unix)]
+    #[test]
+    fn a_digest_read_while_others_could_write_is_not_reused_later() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o755)).unwrap();
+        let shared = temp.path().join("shared");
+        fs::create_dir(&shared).unwrap();
+        let artifact = temp.path().join("download");
+        fs::write(&artifact, b"downloaded bytes").unwrap();
+        fs::set_permissions(&artifact, fs::Permissions::from_mode(0o666)).unwrap();
         ensure_shared_artifact_sha256(&artifact, &shared).unwrap();
-        // A cached digest is not proof of local production, even with an exact
-        // source fingerprint. Re-reading the bytes must catch this mismatch.
+        let recorded: ArtifactSourceIdentity =
+            serde_json::from_slice(&fs::read(shared_artifact_source_path(&shared)).unwrap())
+                .unwrap();
+        assert!(!recorded.hashed_while_service_only);
+        fs::set_permissions(&artifact, fs::Permissions::from_mode(0o644)).unwrap();
         fs::write(shared_artifact_sha256_path(&shared), "0".repeat(64)).unwrap();
         assert!(ensure_shared_artifact_sha256(&artifact, &shared).is_err());
+    }
+
+    #[test]
+    fn legacy_digest_identity_is_never_reused_by_the_hashed_path() {
+        let identity: super::ArtifactSourceIdentity = serde_json::from_str(
+            r#"{"canonical_path":"old","len":1,"modified_secs":1,"modified_nanos":0,"inode":[1,2,3,4]}"#,
+        )
+        .unwrap();
+        assert!(!identity.hashed_while_service_only);
+        assert!(!identity.covers_hashed(&identity));
     }
 
     #[cfg(unix)]

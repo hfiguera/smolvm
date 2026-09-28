@@ -716,7 +716,59 @@ fn check_checkpoint_layout(footer: &smolvm_pack::format::PackFooter, len: u64) -
 
 /// Verify a single-file artifact before reading its manifest or extracting it.
 pub fn verified_sidecar_footer(artifact: &Path) -> Result<smolvm_pack::format::PackFooter> {
-    Ok(verify_sidecar_pinned(artifact)?.footer)
+    #[cfg(unix)]
+    if let Some(footer) = remembered_verification(artifact) {
+        return Ok(footer);
+    }
+    let verified = verify_sidecar_pinned(artifact)?;
+    #[cfg(unix)]
+    remember_verification(artifact, &verified);
+    Ok(verified.footer)
+}
+
+/// Footers this process verified in full, by the exact inode it read. A
+/// server creating many machines from one pack verifies it once instead of
+/// reading the whole pack on every create (#1454).
+#[cfg(unix)]
+static VERIFIED_SIDECARS: std::sync::Mutex<
+    Vec<(SidecarIdentity, smolvm_pack::format::PackFooter)>,
+> = std::sync::Mutex::new(Vec::new());
+
+/// Bound on remembered verifications; the oldest is forgotten first.
+#[cfg(unix)]
+const MAX_VERIFIED_SIDECARS: usize = 64;
+
+/// A remembered verification that still covers `artifact`: the same inode,
+/// unchanged, and writable by nobody but the service, so its bytes are the
+/// ones that were verified.
+#[cfg(unix)]
+fn remembered_verification(artifact: &Path) -> Option<smolvm_pack::format::PackFooter> {
+    if !smolvm_pack::extract::only_service_can_write(artifact) {
+        return None;
+    }
+    let identity = SidecarIdentity::of(&std::fs::File::open(artifact).ok()?).ok()?;
+    let verified = VERIFIED_SIDECARS.lock().ok()?;
+    verified
+        .iter()
+        .find(|(known, _)| *known == identity)
+        .map(|(_, footer)| *footer)
+}
+
+/// Remember a full verification if nobody but the service could write the
+/// artifact while it was read. (Its identity was stable across the read.)
+#[cfg(unix)]
+fn remember_verification(artifact: &Path, verified: &VerifiedSidecar) {
+    if !smolvm_pack::extract::only_service_can_write(artifact) || !verified.covers(artifact) {
+        return;
+    }
+    let Ok(mut remembered) = VERIFIED_SIDECARS.lock() else {
+        return;
+    };
+    remembered.retain(|(known, _)| *known != verified.identity);
+    if remembered.len() >= MAX_VERIFIED_SIDECARS {
+        remembered.remove(0);
+    }
+    remembered.push((verified.identity, verified.footer));
 }
 
 /// The exact inode a verification read, as the kernel reports it. `ctime` is
@@ -4475,6 +4527,46 @@ mod tests {
         assert!(matches!(outcome, SidecarVerification::ChangedDuringRead));
         assert!(verified_sidecar_footer(&artifact).is_ok());
         assert!(verified_sidecar_footer(&alias).is_ok());
+    }
+
+    /// Creates from one private pack verify it once, not on every create
+    /// (#1454); any change to the pack or to who may write it ends the reuse.
+    #[cfg(unix)]
+    #[test]
+    fn a_private_sidecar_is_verified_once_per_unchanged_inode() {
+        use std::io::{Seek, SeekFrom, Write};
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        let artifact = packed_sidecar(dir.path(), "a.smolcheckpoint", "verified-once");
+        std::fs::set_permissions(&artifact, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(remembered_verification(&artifact).is_none());
+        let footer = verified_sidecar_footer(&artifact).unwrap();
+        assert_eq!(
+            remembered_verification(&artifact).map(|known| known.checksum),
+            Some(footer.checksum)
+        );
+
+        // Once others may write it, the earlier verification no longer
+        // vouches for its bytes, even after it is made private again.
+        std::fs::set_permissions(&artifact, std::fs::Permissions::from_mode(0o666)).unwrap();
+        assert!(remembered_verification(&artifact).is_none());
+        std::fs::set_permissions(&artifact, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(remembered_verification(&artifact).is_none());
+        verified_sidecar_footer(&artifact).unwrap();
+        assert!(remembered_verification(&artifact).is_some());
+
+        // A write in place is caught by a fresh verification.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&artifact)
+            .unwrap();
+        file.seek(SeekFrom::Start(footer.assets_offset)).unwrap();
+        file.write_all(b"corrupt").unwrap();
+        drop(file);
+        assert!(remembered_verification(&artifact).is_none());
+        assert!(verified_sidecar_footer(&artifact).is_err());
     }
 
     #[cfg(unix)]
