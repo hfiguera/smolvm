@@ -103,7 +103,6 @@ pub(crate) fn lock_saved_execution(source: &str) -> Result<ForkSourceLock> {
     )
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
 pub(crate) fn try_lock_fork_source(source: &str) -> Result<Option<ForkSourceLock>> {
     validate_vm_name(source, "fork source").map_err(|error| Error::config("fork source", error))?;
     ForkSourceLock::try_acquire_at(&fork_source_lock_path(source))
