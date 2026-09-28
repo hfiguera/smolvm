@@ -1436,7 +1436,6 @@ fn capture_with_completion(
             .is_some_and(|bytes| bytes > 0)
         && smolvm_pack::extract::shared_extract_enabled();
     let sparse_capable = cfg!(all(target_os = "linux", target_arch = "x86_64"))
-        && options.store_dir.is_none()
         && crate::agent::fork::control_socket_cmd(&control, "SAVE_SPARSE_CAPABILITIES")?.trim()
             == "OK sparse-stream-v1 ownership-v1";
     let max_memory_image = max_checkpoint_memory_image(vm.mem, vm.source_smolmachine.is_some())?;
@@ -1558,7 +1557,13 @@ fn capture_with_completion(
 
     let mut stored = stored;
     let stored_memory = if let Some((_, writer)) = stored.as_mut() {
-        if prepared {
+        if let Some(stream) = streamed_memory.as_mut() {
+            let memory = writer
+                .ingest_sparse_memory(stream)
+                .map_err(|e| Error::agent("store sparse checkpoint memory", e.to_string()))?;
+            pause.prepared_save = None;
+            Some(memory)
+        } else if prepared {
             let mut stream = crate::platform::uds::UdsStream::connect(&pause.control)
                 .map_err(|e| Error::agent("connect checkpoint stream", e.to_string()))?;
             stream

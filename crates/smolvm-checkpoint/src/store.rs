@@ -344,6 +344,42 @@ impl Writer {
         self.ingest("checkpoint/memory.bin", size, 0o600, source)
     }
 
+    /// Ingest the runtime's sparse RAM stream without sending or scanning
+    /// whole-hole chunks. The runtime's final success reply is required before
+    /// this file can be included in a published checkpoint.
+    pub fn ingest_sparse_memory(
+        &mut self,
+        source: &mut smolvm_pack::checkpoint_stream::CheckpointStream<'_>,
+    ) -> io::Result<StoredFile> {
+        let size = source.memory_len();
+        if size == 0 || size > MAX_BYTES {
+            return Err(invalid(
+                "checkpoint RAM stream exceeds configured memory layout",
+            ));
+        }
+        let mut remaining = size;
+        let chunks = self.ingest_chunks(|buffer| {
+            if remaining == 0 {
+                return Ok(None);
+            }
+            let count = remaining.min(CHUNK_SIZE as u64) as usize;
+            let job = if source.read_sparse_chunk(buffer, count)? {
+                Job::Data
+            } else {
+                Job::Hole(count)
+            };
+            remaining -= count as u64;
+            Ok(Some(job))
+        })?;
+        source.finish_sparse()?;
+        Ok(StoredFile {
+            path: "checkpoint/memory.bin".into(),
+            size,
+            mode: 0o600,
+            chunks,
+        })
+    }
+
     /// Ingest a stable directory tree. Symlinks and special files are rejected.
     pub fn ingest_tree(&mut self, root: &Path) -> io::Result<Vec<StoredFile>> {
         fn visit(
@@ -2437,6 +2473,58 @@ mod tests {
             )
             .unwrap();
         writer.finish(directory, manifest(), vec![file]).unwrap()
+    }
+
+    #[test]
+    fn sparse_runtime_memory_skips_whole_holes_and_restores_exact_bytes() {
+        let root = tempfile::tempdir().unwrap();
+        let saved = root.path().join("saved");
+        fs::create_dir(&saved).unwrap();
+        let mut writer = Writer::new(&root.path().join("cache"), &saved).unwrap();
+        let logical = 4 * CHUNK_SIZE as u64 + 17;
+        let ranges = [
+            (1024_u64, 512_u64),
+            (3 * CHUNK_SIZE as u64 - 512, 1024),
+            (3 * CHUNK_SIZE as u64 + 1024, 513),
+        ];
+        let mut wire = b"SMOLCKS1".to_vec();
+        wire.extend_from_slice(&3_u32.to_le_bytes());
+        wire.extend_from_slice(&3_u32.to_le_bytes());
+        wire.extend_from_slice(b"cpumapSMOLRSP1");
+        wire.extend_from_slice(&logical.to_le_bytes());
+        wire.extend_from_slice(&4_u32.to_le_bytes());
+        for (offset, len) in ranges.into_iter().chain([(logical, 0)]) {
+            wire.extend_from_slice(&offset.to_le_bytes());
+            wire.extend_from_slice(&len.to_le_bytes());
+        }
+        wire.extend_from_slice(&[0xA5; 512]);
+        wire.extend_from_slice(&[0xC3; 1024]);
+        wire.extend_from_slice(&[0x5A; 513]);
+        wire.extend_from_slice(format!("OK saved ({logical} bytes, 1 regions)\n").as_bytes());
+
+        let mut input = wire.as_slice();
+        let mut stream =
+            smolvm_pack::checkpoint_stream::CheckpointStream::read(&mut input, logical).unwrap();
+        let file = writer.ingest_sparse_memory(&mut stream).unwrap();
+        assert_eq!(file.chunks.len(), 5);
+        assert!(file.chunks[1].is_none());
+        let stats = writer.finish(&saved, manifest(), vec![file]).unwrap();
+        assert_eq!(stats.zero_bytes, CHUNK_SIZE as u64 + 17);
+        let restored = root.path().join("restored");
+        materialize(&saved, &restored).unwrap();
+        let bytes = fs::read(restored.join("checkpoint/memory.bin")).unwrap();
+        assert_eq!(bytes.len(), logical as usize);
+        assert!(bytes[..1024].iter().all(|byte| *byte == 0));
+        assert_eq!(&bytes[1024..1536], &[0xA5; 512]);
+        assert_eq!(
+            &bytes[3 * CHUNK_SIZE - 512..3 * CHUNK_SIZE + 512],
+            &[0xC3; 1024]
+        );
+        assert_eq!(
+            &bytes[3 * CHUNK_SIZE + 1024..3 * CHUNK_SIZE + 1537],
+            &[0x5A; 513]
+        );
+        assert!(bytes[3 * CHUNK_SIZE + 1537..].iter().all(|byte| *byte == 0));
     }
 
     fn lineage_manifest(id: &str, parent: Option<&str>, created_at: &str) -> PackManifest {

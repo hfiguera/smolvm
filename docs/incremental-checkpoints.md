@@ -45,6 +45,8 @@ This is incremental **storage**, not dirty-page-only capture: RAM is still read
 for each checkpoint, while unchanged chunks are reused instead of compressed
 and written again. Savings depend on how much RAM and disk content changes.
 Capture time is not guaranteed to fall in proportion to the bytes saved.
+On Linux x86_64 with a sparse-stream runtime, empty RAM ranges are omitted
+from the runtime-to-store transfer, and whole empty chunks need no object work.
 
 Stored-checkpoint chunk reuse does not change the live branching limits. A live
 branch lineage and its QCOW2 disk backing chain are each bounded at 32 levels;

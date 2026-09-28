@@ -12,6 +12,8 @@ pub struct CheckpointStream<'a> {
     layout: Vec<u8>,
     logical: u64,
     ranges: Vec<(u64, u64)>,
+    position: u64,
+    range_index: usize,
     consumed: bool,
     copy: Option<std::fs::File>,
     copy_failed: bool,
@@ -89,6 +91,8 @@ impl<'a> CheckpointStream<'a> {
             layout,
             logical,
             ranges,
+            position: 0,
+            range_index: 0,
             consumed: false,
             copy: None,
             copy_failed: false,
@@ -123,8 +127,84 @@ impl<'a> CheckpointStream<'a> {
         self.logical
     }
 
+    /// Read the next logical RAM chunk for a checkpoint store. A whole hole
+    /// returns `false` without allocating or reading from the socket. Chunks
+    /// containing data are filled with zeros between the sparse ranges.
+    pub fn read_sparse_chunk(&mut self, buffer: &mut Vec<u8>, count: usize) -> io::Result<bool> {
+        let end = self
+            .position
+            .checked_add(count as u64)
+            .ok_or_else(invalid)?;
+        if self.consumed || count == 0 || end > self.logical {
+            return Err(invalid());
+        }
+        let start = self.position;
+        while self.range_index + 1 < self.ranges.len() {
+            let (offset, len) = self.ranges[self.range_index];
+            if offset + len > start {
+                break;
+            }
+            self.range_index += 1;
+        }
+        if self.ranges[self.range_index].0 >= end {
+            self.position = end;
+            return Ok(false);
+        }
+        buffer.resize(count, 0);
+        buffer.fill(0);
+        while self.range_index + 1 < self.ranges.len() {
+            let (offset, len) = self.ranges[self.range_index];
+            if offset >= end {
+                break;
+            }
+            let from = offset.max(self.position);
+            let to = (offset + len).min(end);
+            if from < to {
+                self.source
+                    .read_exact(&mut buffer[(from - start) as usize..(to - start) as usize])?;
+                self.position = to;
+            }
+            if to == offset + len {
+                self.range_index += 1;
+            } else {
+                break;
+            }
+        }
+        self.position = end;
+        Ok(true)
+    }
+
+    /// Require the runtime's success reply after the complete sparse RAM
+    /// payload. A stored checkpoint must call this before publishing its index.
+    pub fn finish_sparse(&mut self) -> io::Result<()> {
+        if self.consumed || self.position != self.logical {
+            return Err(invalid());
+        }
+        self.consumed = true;
+        self.read_completion_reply()
+    }
+
+    fn read_completion_reply(&mut self) -> io::Result<()> {
+        let mut reply = Vec::new();
+        (&mut *self.source).take(4097).read_to_end(&mut reply)?;
+        if reply.len() > 4096 {
+            return Err(invalid());
+        }
+        let reply = std::str::from_utf8(&reply).map_err(|_| invalid())?;
+        let prefix = format!("OK saved ({} bytes, ", self.logical);
+        let regions = reply
+            .strip_prefix(&prefix)
+            .and_then(|s| s.strip_suffix(" regions)\n"))
+            .and_then(|s| s.parse::<u32>().ok())
+            .filter(|n| *n > 0);
+        if regions.is_none() {
+            return Err(invalid());
+        }
+        Ok(())
+    }
+
     pub(crate) fn append<W: Write>(&mut self, archive: &mut tar::Builder<W>) -> io::Result<()> {
-        if self.consumed {
+        if self.consumed || self.position != 0 {
             return Err(invalid());
         }
         self.consumed = true;
@@ -187,22 +267,7 @@ impl<'a> CheckpointStream<'a> {
         }
         let padding = (512 - stored % 512) % 512;
         archive.get_mut().write_all(&[0; 512][..padding as usize])?;
-        let mut reply = Vec::new();
-        (&mut *self.source).take(4097).read_to_end(&mut reply)?;
-        if reply.len() > 4096 {
-            return Err(invalid());
-        }
-        let reply = std::str::from_utf8(&reply).map_err(|_| invalid())?;
-        let prefix = format!("OK saved ({} bytes, ", self.logical);
-        let regions = reply
-            .strip_prefix(&prefix)
-            .and_then(|s| s.strip_suffix(" regions)\n"))
-            .and_then(|s| s.parse::<u32>().ok())
-            .filter(|n| *n > 0);
-        if regions.is_none() {
-            return Err(invalid());
-        }
-        Ok(())
+        self.read_completion_reply()
     }
 }
 

@@ -51,6 +51,38 @@ fn sparse_archive_preserves_bytes_and_requires_completion() {
 }
 
 #[test]
+fn sparse_chunks_skip_holes_and_require_runtime_completion() {
+    let good = wire(b"OK saved (8192 bytes, 1 regions)\n");
+    let mut input = good.as_slice();
+    let mut stream = CheckpointStream::read(&mut input, 8192).unwrap();
+    let mut buffer = Vec::new();
+    assert!(!stream.read_sparse_chunk(&mut buffer, 1024).unwrap());
+    assert!(
+        buffer.is_empty(),
+        "a whole hole should not allocate a buffer"
+    );
+    assert!(stream.read_sparse_chunk(&mut buffer, 4096).unwrap());
+    assert_eq!(&buffer[..3], b"RAM");
+    assert!(buffer[3..].iter().all(|byte| *byte == 0));
+    assert!(!stream.read_sparse_chunk(&mut buffer, 3072).unwrap());
+    stream.finish_sparse().unwrap();
+    assert!(stream.finish_sparse().is_err());
+
+    let bad = wire(b"ERR EIO save failed\n");
+    let mut input = bad.as_slice();
+    let mut stream = CheckpointStream::read(&mut input, 8192).unwrap();
+    assert!(
+        stream.finish_sparse().is_err(),
+        "RAM must be consumed first"
+    );
+    assert!(stream.read_sparse_chunk(&mut buffer, 8192).unwrap());
+    assert!(
+        stream.finish_sparse().is_err(),
+        "failure reply must be rejected"
+    );
+}
+
+#[test]
 fn failed_runtime_completion_never_publishes_an_artifact() {
     for reply in [
         b"ERR EIO output failed\n".as_slice(),
