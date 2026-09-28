@@ -4119,8 +4119,9 @@ pub(crate) fn prepare_paused_restore(record: &VmRecord) -> Result<()> {
             "source VM has not stopped",
         ));
     }
-    let footer = verified_sidecar_footer(artifact)?;
-    ensure_checkpoint_layout(artifact)?;
+    let footer = ensure_checkpoint_layout(artifact)?;
+    // Treat this manifest as untrusted until extraction verifies the full
+    // sidecar checksum. No machine state changes before that verification.
     let manifest = smolvm_pack::packer::read_manifest_from_sidecar(artifact)
         .map_err(|e| Error::agent("read paused checkpoint", e.to_string()))?;
     let checkpoint = manifest
@@ -4148,9 +4149,8 @@ pub(crate) fn prepare_paused_restore(record: &VmRecord) -> Result<()> {
     if keep_disks {
         skip.push(PathBuf::from("checkpoint/disks"));
     }
-    // The sidecar checksum was checked above. Extract only the files the
-    // installer will read; the remaining archive assets stay available for
-    // portable restore without adding work to same-machine resume.
+    // Extract only the files the installer will read. The extractor verifies
+    // every compressed and manifest byte before any state is installed.
     let mut required: Vec<PathBuf> = expected_assets(checkpoint)
         .into_iter()
         .map(|(_, path)| PathBuf::from(path))
@@ -4172,7 +4172,7 @@ pub(crate) fn prepare_paused_restore(record: &VmRecord) -> Result<()> {
             .prefix("resume-")
             .tempdir_in(parent)?;
         let extract_started = std::time::Instant::now();
-        smolvm_pack::extract::extract_checkpoint_sidecar(
+        smolvm_pack::extract::extract_verified_checkpoint_sidecar(
             artifact,
             staged.path(),
             &footer,

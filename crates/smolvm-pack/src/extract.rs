@@ -2545,9 +2545,209 @@ pub fn extract_checkpoint_sidecar(
     Ok(())
 }
 
+/// Extract the local resume inputs and verify the complete sidecar in one
+/// sequential read. No extracted input may be installed until this returns.
+pub fn extract_verified_checkpoint_sidecar(
+    sidecar_path: &Path,
+    dest: &Path,
+    footer: &PackFooter,
+    skip: &[PathBuf],
+    required: &[PathBuf],
+) -> std::io::Result<()> {
+    let mut file = File::open(sidecar_path)?;
+    let before = file.metadata()?;
+    let actual_footer =
+        crate::packer::read_footer_from_file(&mut file).map_err(std::io::Error::other)?;
+    if actual_footer.to_bytes() != footer.to_bytes() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "checkpoint footer changed before extraction",
+        ));
+    }
+    file.seek(SeekFrom::Start(0))?;
+    fs::create_dir_all(dest)?;
+    let mut reader = ChecksumReader::new(file);
+    {
+        let assets = (&mut reader).take(footer.assets_size);
+        let decoder = zstd::stream::Decoder::new(assets)
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+        let mut archive = tar::Archive::new(decoder);
+        let skip: Vec<PathBuf> = skip.iter().map(|path| normalize_path(path)).collect();
+        safe_unpack_skipping(
+            &mut archive,
+            dest,
+            &SafeUnpackLimits::from_env(),
+            true,
+            false,
+            &skip,
+            required,
+        )?;
+    }
+    let checked_size = footer
+        .assets_size
+        .checked_add(footer.manifest_size)
+        .ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, "checkpoint size overflow")
+        })?;
+    let mut remaining = checked_size.checked_sub(reader.bytes).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "checkpoint reader passed manifest",
+        )
+    })?;
+    let mut buffer = [0u8; 256 * 1024];
+    while remaining != 0 {
+        let chunk = remaining.min(buffer.len() as u64) as usize;
+        let count = reader.read(&mut buffer[..chunk])?;
+        if count == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "checkpoint ended before checksum completed",
+            ));
+        }
+        remaining -= count as u64;
+    }
+    let after = reader.inner.metadata()?;
+    let path_after = fs::metadata(sidecar_path)?;
+    if !same_checkpoint_identity(&before, &after) || !same_checkpoint_identity(&before, &path_after)
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "checkpoint changed during extraction",
+        ));
+    }
+    if reader.hasher.finalize() != footer.checksum {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "checkpoint checksum mismatch",
+        ));
+    }
+    Ok(())
+}
+
+struct ChecksumReader<R> {
+    inner: R,
+    hasher: crc32fast::Hasher,
+    bytes: u64,
+}
+
+impl<R> ChecksumReader<R> {
+    fn new(inner: R) -> Self {
+        Self {
+            inner,
+            hasher: crc32fast::Hasher::new(),
+            bytes: 0,
+        }
+    }
+}
+
+impl<R: Read> Read for ChecksumReader<R> {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        let count = self.inner.read(buffer)?;
+        self.hasher.update(&buffer[..count]);
+        self.bytes += count as u64;
+        Ok(count)
+    }
+}
+
+#[cfg(unix)]
+fn same_checkpoint_identity(before: &fs::Metadata, after: &fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    before.dev() == after.dev()
+        && before.ino() == after.ino()
+        && before.len() == after.len()
+        && before.mtime() == after.mtime()
+        && before.mtime_nsec() == after.mtime_nsec()
+        && before.ctime() == after.ctime()
+        && before.ctime_nsec() == after.ctime_nsec()
+}
+
+#[cfg(not(unix))]
+fn same_checkpoint_identity(before: &fs::Metadata, after: &fs::Metadata) -> bool {
+    before.len() == after.len() && before.modified().ok() == after.modified().ok()
+}
+
 #[cfg(test)]
 mod resume_extract_tests {
     use super::*;
+
+    #[test]
+    fn one_pass_extract_checks_unneeded_archive_bytes() {
+        let temp = tempfile::tempdir().unwrap();
+        let artifact = temp.path().join("pause.smolcheckpoint");
+        let encoder = zstd::stream::Encoder::new(File::create(&artifact).unwrap(), 1).unwrap();
+        let mut tar = tar::Builder::new(encoder);
+        for (path, bytes) in [
+            ("checkpoint/memory.bin", b"memory".as_slice()),
+            ("portable-after.txt", b"unused".as_slice()),
+        ] {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(bytes.len() as u64);
+            header.set_cksum();
+            tar.append_data(&mut header, path, bytes).unwrap();
+        }
+        tar.into_inner().unwrap().finish().unwrap();
+        let assets_size = fs::metadata(&artifact).unwrap().len();
+        let manifest = b"{}";
+        File::options()
+            .append(true)
+            .open(&artifact)
+            .unwrap()
+            .write_all(manifest)
+            .unwrap();
+        let footer = PackFooter {
+            stub_size: 0,
+            assets_offset: 0,
+            assets_size,
+            manifest_offset: assets_size,
+            manifest_size: manifest.len() as u64,
+            checksum: crate::assets::crc32_file_range(
+                &artifact,
+                0,
+                assets_size + manifest.len() as u64,
+            )
+            .unwrap(),
+        };
+        File::options()
+            .append(true)
+            .open(&artifact)
+            .unwrap()
+            .write_all(&footer.to_bytes())
+            .unwrap();
+        let restored = temp.path().join("restored");
+        extract_verified_checkpoint_sidecar(
+            &artifact,
+            &restored,
+            &footer,
+            &[],
+            &["checkpoint/memory.bin".into()],
+        )
+        .unwrap();
+        assert_eq!(
+            fs::read(restored.join("checkpoint/memory.bin")).unwrap(),
+            b"memory"
+        );
+        assert!(!restored.join("portable-after.txt").exists());
+
+        let bad_footer = PackFooter {
+            checksum: footer.checksum ^ 1,
+            ..footer
+        };
+        let mut file = File::options().write(true).open(&artifact).unwrap();
+        file.seek(SeekFrom::End(-(crate::format::FOOTER_SIZE as i64)))
+            .unwrap();
+        file.write_all(&bad_footer.to_bytes()).unwrap();
+        let error = extract_verified_checkpoint_sidecar(
+            &artifact,
+            &temp.path().join("rejected"),
+            &bad_footer,
+            &[],
+            &["checkpoint/memory.bin".into()],
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("checksum mismatch"));
+    }
 
     #[test]
     fn old_archive_order_still_restores_required_assets() {
