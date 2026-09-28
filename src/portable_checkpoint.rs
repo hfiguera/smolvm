@@ -4148,12 +4148,39 @@ pub(crate) fn prepare_paused_restore(record: &VmRecord) -> Result<()> {
     if keep_disks {
         skip.push(PathBuf::from("checkpoint/disks"));
     }
+    // The sidecar checksum was checked above. Extract only the files the
+    // installer will read; the remaining archive assets stay available for
+    // portable restore without adding work to same-machine resume.
+    let mut required: Vec<PathBuf> = expected_assets(checkpoint)
+        .into_iter()
+        .map(|(_, path)| PathBuf::from(path))
+        .collect();
+    if let Some(asset) = &checkpoint.credential_ca {
+        required.push(PathBuf::from(&asset.path));
+    }
+    if !keep_disks {
+        required.extend(
+            checkpoint
+                .disks
+                .iter()
+                .flat_map(|disk| disk.files.iter())
+                .map(|file| PathBuf::from(&file.asset.path)),
+        );
+    }
     let extract_and_install = |parent: &Path| -> Result<()> {
         let staged = tempfile::Builder::new()
             .prefix("resume-")
             .tempdir_in(parent)?;
-        smolvm_pack::extract::extract_checkpoint_sidecar(artifact, staged.path(), &footer, &skip)
-            .map_err(|e| Error::agent("extract paused checkpoint", e.to_string()))?;
+        let extract_started = std::time::Instant::now();
+        smolvm_pack::extract::extract_checkpoint_sidecar(
+            artifact,
+            staged.path(),
+            &footer,
+            &skip,
+            &required,
+        )
+        .map_err(|e| Error::agent("extract paused checkpoint", e.to_string()))?;
+        tracing::info!(machine = %record.name, phase = "extract", elapsed_ms = extract_started.elapsed().as_millis(), "paused resume phase completed");
         clear_stale_restore_state(&vm_data)?;
         install_with(staged.path(), &vm_data, checkpoint, keep_disks)
     };

@@ -835,7 +835,7 @@ fn safe_unpack_with_policy<R: Read>(
     checkpoint: bool,
     owner_xattr: bool,
 ) -> std::io::Result<UnpackReport> {
-    safe_unpack_skipping(archive, dest, limits, checkpoint, owner_xattr, &[])
+    safe_unpack_skipping(archive, dest, limits, checkpoint, owner_xattr, &[], &[])
 }
 
 /// [`safe_unpack_with_policy`], leaving out the archive paths in `skip` and
@@ -847,8 +847,11 @@ fn safe_unpack_skipping<R: Read>(
     checkpoint: bool,
     owner_xattr: bool,
     skip: &[PathBuf],
+    required: &[PathBuf],
 ) -> std::io::Result<UnpackReport> {
     let mut report = UnpackReport::default();
+    let mut remaining: std::collections::HashSet<PathBuf> =
+        required.iter().map(|path| normalize_path(path)).collect();
     // Use `normalize_path` (not `canonicalize`) for the containment base so it
     // matches the per-entry `normalized` paths, which are built from this same
     // plain `dest`. On Windows `canonicalize` returns a `\\?\`-verbatim path
@@ -892,6 +895,17 @@ fn safe_unpack_skipping<R: Read>(
             .any(|skip| normalize_path(&entry_path).starts_with(skip))
         {
             continue;
+        }
+        let normalized_entry = normalize_path(&entry_path);
+        let required_here = remaining.contains(&normalized_entry);
+        if required_here
+            && entry_type != tar::EntryType::Regular
+            && entry_type != tar::EntryType::GNUSparse
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "required checkpoint asset is not a regular file",
+            ));
         }
         // RAM is a host runtime input, not a guest filesystem entry. Never
         // restore the exporting VMM's UID onto this shared cache object.
@@ -1256,6 +1270,19 @@ fn safe_unpack_skipping<R: Read>(
             record_override_stat(&full_path, uid, gid, archived)?;
         }
         report.entries += 1;
+        if required_here {
+            remaining.remove(&normalized_entry);
+            if remaining.is_empty() {
+                break;
+            }
+        }
+    }
+
+    if !remaining.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "checkpoint archive is missing required assets",
+        ));
     }
 
     // Apply deferred directory permissions now that all children are written.
@@ -2492,12 +2519,14 @@ pub fn unpack_checkpoint_history(
 /// also carries the runtime libraries, agent rootfs and storage template, so
 /// the checkpoint can move to another host, but resuming it here uses the
 /// host's own. Unlike [`extract_sidecar`] this writes no cache markers and
-/// does no layer post-processing.
+/// does no layer post-processing. When `required` is nonempty, extraction
+/// stops after those files; callers must verify the full sidecar first.
 pub fn extract_checkpoint_sidecar(
     sidecar_path: &Path,
     dest: &Path,
     footer: &PackFooter,
     skip: &[PathBuf],
+    required: &[PathBuf],
 ) -> std::io::Result<()> {
     fs::create_dir_all(dest)?;
     let decoder = zstd::stream::Decoder::new(File::open(sidecar_path)?.take(footer.assets_size))
@@ -2511,8 +2540,82 @@ pub fn extract_checkpoint_sidecar(
         true,
         false,
         &skip,
+        required,
     )?;
     Ok(())
+}
+
+#[cfg(test)]
+mod resume_extract_tests {
+    use super::*;
+
+    #[test]
+    fn old_archive_order_still_restores_required_assets() {
+        let temp = tempfile::tempdir().unwrap();
+        let artifact = temp.path().join("old.smolcheckpoint");
+        let encoder = zstd::stream::Encoder::new(File::create(&artifact).unwrap(), 1).unwrap();
+        let mut tar = tar::Builder::new(encoder);
+        for (path, bytes) in [
+            ("agent-rootfs.tar", b"runtime".as_slice()),
+            ("checkpoint/disks/storage/0", b"disk".as_slice()),
+            ("checkpoint/checkpoint.bin", b"state".as_slice()),
+            ("checkpoint/manifest.bin", b"layout".as_slice()),
+            ("checkpoint/memory.bin", b"memory".as_slice()),
+            ("portable-after.txt", b"unused".as_slice()),
+        ] {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(bytes.len() as u64);
+            header.set_cksum();
+            tar.append_data(&mut header, path, bytes).unwrap();
+        }
+        tar.into_inner().unwrap().finish().unwrap();
+        let footer = PackFooter {
+            stub_size: 0,
+            assets_offset: 0,
+            assets_size: fs::metadata(&artifact).unwrap().len(),
+            manifest_offset: 0,
+            manifest_size: 0,
+            checksum: 0,
+        };
+        let required = vec![
+            "checkpoint/checkpoint.bin".into(),
+            "checkpoint/manifest.bin".into(),
+            "checkpoint/memory.bin".into(),
+        ];
+        let restored = temp.path().join("restored");
+        extract_checkpoint_sidecar(
+            &artifact,
+            &restored,
+            &footer,
+            &["agent-rootfs.tar".into(), "checkpoint/disks".into()],
+            &required,
+        )
+        .unwrap();
+        assert_eq!(
+            fs::read(restored.join("checkpoint/memory.bin")).unwrap(),
+            b"memory"
+        );
+        assert!(!restored.join("agent-rootfs.tar").exists());
+        assert!(!restored.join("checkpoint/disks").exists());
+
+        let with_prefix = temp.path().join("with-prefix");
+        extract_checkpoint_sidecar(&artifact, &with_prefix, &footer, &[], &required).unwrap();
+        assert_eq!(
+            fs::read(with_prefix.join("agent-rootfs.tar")).unwrap(),
+            b"runtime"
+        );
+        assert!(!with_prefix.join("portable-after.txt").exists());
+
+        let missing = temp.path().join("missing");
+        assert!(extract_checkpoint_sidecar(
+            &artifact,
+            &missing,
+            &footer,
+            &[],
+            &["checkpoint/not-present.bin".into()],
+        )
+        .is_err());
+    }
 }
 
 fn extract_sidecar_inner(

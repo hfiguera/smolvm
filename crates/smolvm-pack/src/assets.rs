@@ -1130,12 +1130,24 @@ impl AssetCollector {
                 .map_err(|e| PackError::Compression(e.to_string()))?;
         }
         let mut tar_builder = tar::Builder::new(encoder);
+        // Put resume inputs before disks and portable runtime assets so local
+        // resume can stop decoding after the files it needs are extracted.
+        let checkpoint_dir = self.staging_dir.join("checkpoint");
+        let streamed = stream.is_some();
+        if streamed && checkpoint_dir.is_dir() {
+            tar_builder
+                .append_dir("checkpoint", &checkpoint_dir)
+                .map_err(|error| PackError::Tar(error.to_string()))?;
+        }
+        if let Some(stream) = stream {
+            stream.append(&mut tar_builder)?;
+        }
 
         // Sort entries for deterministic tar ordering (consistent checksums)
         let mut entries: Vec<_> = fs::read_dir(&self.staging_dir)?
             .filter_map(|e| e.ok())
             .collect();
-        entries.sort_by_key(|e| e.file_name());
+        entries.sort_by_key(|e| (e.file_name() != "checkpoint", e.file_name()));
 
         for entry in entries {
             let name = entry.file_name();
@@ -1143,6 +1155,32 @@ impl AssetCollector {
                 continue; // libs go in the stub, not the sidecar
             }
             let path = entry.path();
+            if name == "checkpoint" && path.is_dir() {
+                if !streamed {
+                    tar_builder
+                        .append_dir("checkpoint", &path)
+                        .map_err(|error| PackError::Tar(error.to_string()))?;
+                }
+                let mut children = fs::read_dir(&path)?.collect::<std::io::Result<Vec<_>>>()?;
+                children.sort_by_key(|child| (child.file_name() == "disks", child.file_name()));
+                for child in children {
+                    let child_path = child.path();
+                    let child_name = Path::new("checkpoint").join(child.file_name());
+                    #[cfg(target_os = "macos")]
+                    append_macos_tree(&mut tar_builder, &child_path, &child_name)?;
+                    #[cfg(not(target_os = "macos"))]
+                    if child_path.is_dir() {
+                        tar_builder
+                            .append_dir_all(&child_name, &child_path)
+                            .map_err(|error| PackError::Tar(error.to_string()))?;
+                    } else {
+                        tar_builder
+                            .append_path_with_name(&child_path, &child_name)
+                            .map_err(|error| PackError::Tar(error.to_string()))?;
+                    }
+                }
+                continue;
+            }
             #[cfg(target_os = "macos")]
             append_macos_tree(&mut tar_builder, &path, Path::new(&name))?;
             #[cfg(not(target_os = "macos"))]
@@ -1159,9 +1197,6 @@ impl AssetCollector {
             }
         }
 
-        if let Some(stream) = stream {
-            stream.append(&mut tar_builder)?;
-        }
         let encoder = tar_builder
             .into_inner()
             .map_err(|e| PackError::Tar(e.to_string()))?;

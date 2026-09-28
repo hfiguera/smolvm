@@ -83,6 +83,83 @@ fn sparse_chunks_skip_holes_and_require_runtime_completion() {
 }
 
 #[test]
+fn streamed_checkpoint_places_resume_inputs_before_portable_assets() {
+    let temp = tempfile::tempdir().unwrap();
+    let staging = temp.path().join("staging");
+    let disk = staging.join("checkpoint/disks/storage/0");
+    std::fs::create_dir_all(disk.parent().unwrap()).unwrap();
+    std::fs::write(&disk, b"disk").unwrap();
+    std::fs::write(staging.join("checkpoint/checkpoint.bin"), b"cpu").unwrap();
+    std::fs::write(staging.join("checkpoint/manifest.bin"), b"map").unwrap();
+    std::fs::write(staging.join("agent-rootfs.tar"), b"runtime").unwrap();
+    let collector = crate::assets::AssetCollector::new(staging).unwrap();
+    let manifest = crate::PackManifest::new(
+        "test".into(),
+        "none".into(),
+        "linux/amd64".into(),
+        "linux/amd64".into(),
+    );
+    let bytes = wire(b"OK saved (8192 bytes, 1 regions)\n");
+    let mut source = bytes.as_slice();
+    let mut stream = CheckpointStream::read(&mut source, 8192).unwrap();
+    let artifact = temp.path().join("checkpoint.smolcheckpoint");
+    crate::Packer::new(manifest)
+        .with_asset_collector(collector)
+        .pack_checkpoint_stream(&artifact, &mut stream)
+        .unwrap();
+    let footer = crate::packer::read_footer_from_sidecar(&artifact).unwrap();
+    assert!(crate::packer::verify_sidecar_checksum(&artifact, &footer).unwrap());
+    let decoder = zstd::stream::Decoder::new(
+        std::fs::File::open(&artifact)
+            .unwrap()
+            .take(footer.assets_size),
+    )
+    .unwrap();
+    let mut archive = tar::Archive::new(decoder);
+    let names: Vec<_> = archive
+        .entries()
+        .unwrap()
+        .map(|entry| entry.unwrap().path().unwrap().into_owned())
+        .collect();
+    let position = |name: &str| {
+        names
+            .iter()
+            .position(|path| path == std::path::Path::new(name))
+            .unwrap()
+    };
+    for name in [
+        "checkpoint/memory.bin",
+        "checkpoint/checkpoint.bin",
+        "checkpoint/manifest.bin",
+    ] {
+        assert!(position(name) < position("checkpoint/disks/storage/0"));
+    }
+    assert!(position("checkpoint/disks/storage/0") < position("agent-rootfs.tar"));
+
+    let restored = temp.path().join("restored");
+    crate::extract::extract_checkpoint_sidecar(
+        &artifact,
+        &restored,
+        &footer,
+        &["checkpoint/disks".into(), "agent-rootfs.tar".into()],
+        &[
+            "checkpoint/memory.bin".into(),
+            "checkpoint/checkpoint.bin".into(),
+            "checkpoint/manifest.bin".into(),
+        ],
+    )
+    .unwrap();
+    let mut memory = vec![0; 8192];
+    std::fs::File::open(restored.join("checkpoint/memory.bin"))
+        .unwrap()
+        .read_exact(&mut memory)
+        .unwrap();
+    assert_eq!(&memory[1024..1027], b"RAM");
+    assert!(!restored.join("checkpoint/disks").exists());
+    assert!(!restored.join("agent-rootfs.tar").exists());
+}
+
+#[test]
 fn failed_runtime_completion_never_publishes_an_artifact() {
     for reply in [
         b"ERR EIO output failed\n".as_slice(),
