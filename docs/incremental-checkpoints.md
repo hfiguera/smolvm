@@ -79,12 +79,13 @@ smolvm machine checkpoint-log ./after.checkpoint
 # ~1   51e0d8c2a9b4  2026-09-22T09:40:11Z  worker  4096 MiB
 # ~2   0c7a44e1fd93  2026-09-22T09:02:56Z  worker  4096 MiB
 
-# Restore two generations back, or by id prefix.
-smolvm machine create --name rollback --from ./after.checkpoint --at ~2
+# Restore two generations back, or by id prefix. Quote ~N so zsh doesn't
+# expand it as a directory-stack entry.
+smolvm machine create --name rollback --from ./after.checkpoint --at '~2'
 smolvm machine create --name rollback --from ./after.checkpoint --at 0c7a44e1
 
 # Export one generation as a single-generation portable file.
-smolvm machine checkpoint --export-from ./after.checkpoint --at ~1 \
+smolvm machine checkpoint --export-from ./after.checkpoint --at '~1' \
   --output ./before.checkpoint
 
 # Everything ever published into a store, with parents.
@@ -102,7 +103,7 @@ version message rather than misreading it.
 ```sh
 smolvm machine checkpoint --export-from ./after.checkpoint -o ./history.checkpoint
 smolvm machine checkpoint-log ./history.checkpoint          # read from the manifest
-smolvm machine create --name rollback --from ./history.checkpoint --at ~2
+smolvm machine create --name rollback --from ./history.checkpoint --at '~2'
 ```
 
 Checkpoints written before lineage existed have no history; captures of a

@@ -3801,7 +3801,7 @@ pub struct CreateCmd {
 
     /// With --from <checkpoint>: restore an earlier generation the checkpoint
     /// retains — `~N` (N back along its history), a generation id, or an id
-    /// prefix. See `machine checkpoint-log`.
+    /// prefix. Quote `~N` in zsh, e.g. `--at '~2'`. See `machine checkpoint-log`.
     #[arg(long, value_name = "GENERATION", requires = "from")]
     pub at: Option<String>,
 

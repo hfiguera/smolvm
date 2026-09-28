@@ -73,7 +73,7 @@ smolvm machine checkpoint --name agent -o agent.checkpoint        # save it, pro
 smolvm machine create --name agent2 --from agent.checkpoint       # resume later or elsewhere
 ```
 
-Rewind to an earlier generation with `--from <checkpoint> --at ~N` (see `machine checkpoint-log`), and stop without losing execution with [pause and resume](docs/pause-resume.md). More in [Branching](docs/branching.md) and [incremental checkpoints](docs/incremental-checkpoints.md).
+Rewind to an earlier generation with `--from <checkpoint> --at '~N'` (see `machine checkpoint-log`), and stop without losing execution with [pause and resume](docs/pause-resume.md). More in [Branching](docs/branching.md) and [incremental checkpoints](docs/incremental-checkpoints.md).
 
 Portable
 --------

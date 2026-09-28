@@ -695,6 +695,13 @@ pub fn resolve_in(lineage: &[Generation], at: &str) -> io::Result<Option<String>
             ))
         })?
     } else {
+        // zsh expands an unquoted `~2` into a directory-stack path before we
+        // ever see it, which would otherwise read as a malformed id.
+        if at.contains('/') {
+            return Err(invalid(format!(
+                "generation {at} looks like a path: the shell expanded ~N, quote it as --at '~N'"
+            )));
+        }
         if at.len() < 8 || !at.bytes().all(|b| b.is_ascii_hexdigit()) {
             return Err(invalid(
                 "generation must be ~N, an id, or an id prefix of 8+ hex characters",
@@ -2670,6 +2677,9 @@ mod tests {
         );
         assert!(resolve_generation(&third, "~3").is_err());
         assert!(resolve_generation(&third, "zz").is_err());
+        // An unquoted ~2 that zsh expanded into a directory path.
+        let expanded = resolve_generation(&third, "/Users/me/src").unwrap_err();
+        assert!(expanded.to_string().contains("quote it as --at '~N'"));
         for (generation, expected) in [(Some(G1), &a), (Some(G2), &b)] {
             let out = root.path().join(format!("restore-{}", generation.unwrap()));
             materialize_generation(&third, generation, &out, None).unwrap();

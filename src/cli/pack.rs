@@ -89,7 +89,7 @@ pub struct CheckpointCmd {
     pub export_from: Option<PathBuf>,
     /// With --export-from: which generation to export — `~N` (N back along
     /// the history, `~0` is the checkpoint itself), a generation id, or an id
-    /// prefix. See `machine checkpoint-log`.
+    /// prefix. Quote `~N` in zsh, e.g. `--at '~1'`. See `machine checkpoint-log`.
     #[arg(long, value_name = "GENERATION", requires = "export_from")]
     pub at: Option<String>,
     /// How many earlier generations to carry: with --store, the new checkpoint
@@ -295,7 +295,7 @@ impl CheckpointLogCmd {
             );
         }
         println!(
-            "restore any of them: smolvm machine create --name <new> --from {} --at ~N",
+            "restore any of them: smolvm machine create --name <new> --from {} --at '~N'",
             checkpoint.display()
         );
         Ok(())
