@@ -2908,8 +2908,24 @@ fn clone_fork_disks(gdir: &Path, snapshot_dir: &Path, clone_dir: &Path) -> Resul
                     clone_dir.join(Path::new(raw).with_extension("qcow2"))
                 }
             };
-            crate::disk_utils::clone_or_copy_file(src, &dst)
-                .map_err(|e| Error::agent("clone disk", format!("{}: {e}", src.display())))?;
+            // A restored checkpoint's disk names its lower layer relative to
+            // its own directory, so a copy in the clone's directory could not
+            // open it. Layer the clone over it with an absolute path instead.
+            let relative_backing = matches!(format, crate::data::disk::DiskFormat::Qcow2)
+                && qcow2_backing_name(src)?.is_some_and(|backing| backing.is_relative());
+            if relative_backing {
+                let base = src
+                    .canonicalize()
+                    .map_err(|e| Error::agent("clone disk", format!("{}: {e}", src.display())))?;
+                crate::agent::create_disk_overlays(&[(
+                    dst,
+                    base,
+                    crate::data::disk::DiskFormat::Qcow2,
+                )])?;
+            } else {
+                crate::disk_utils::clone_or_copy_file(src, &dst)
+                    .map_err(|e| Error::agent("clone disk", format!("{}: {e}", src.display())))?;
+            }
             let marker = Path::new(raw).with_extension("formatted");
             let src_marker = gdir.join(&marker);
             if src_marker.exists() {
