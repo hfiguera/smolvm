@@ -117,10 +117,27 @@ fn remove_readonly_input(vm_dir: &Path) -> std::io::Result<()> {
         match std::fs::remove_dir_all(&dir) {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) if staged_by_root_only(&dir, &error) => {}
             Err(error) => return Err(error),
         }
     }
     Ok(())
+}
+
+/// Only root stages restore input on the shared tmpfs, and that directory is
+/// root-owned mode 0700. Another user cannot look inside it, and none of their
+/// machines' input can be there, so a denied lookup means there is nothing to
+/// remove rather than a failed resume.
+#[cfg(target_os = "linux")]
+fn staged_by_root_only(dir: &Path, error: &std::io::Error) -> bool {
+    error.kind() == std::io::ErrorKind::PermissionDenied
+        && dir.starts_with(RESTORE_TMPFS_ROOT)
+        && unsafe { libc::geteuid() } != 0
+}
+
+#[cfg(not(target_os = "linux"))]
+fn staged_by_root_only(_dir: &Path, _error: &std::io::Error) -> bool {
+    false
 }
 
 #[cfg(target_os = "linux")]
@@ -4296,6 +4313,22 @@ fn consume_with_retained_backing(vm_data_dir: &Path, retain_memory: bool) -> Res
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_denied_root_only_restore_tmpfs_is_not_a_cleanup_failure() {
+        let denied = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+        let staged = Path::new(RESTORE_TMPFS_ROOT).join("abc.restore-input");
+        let expected = unsafe { libc::geteuid() } != 0;
+        assert_eq!(staged_by_root_only(&staged, &denied), expected);
+        // Anywhere else, and any other error, still fails cleanup.
+        assert!(!staged_by_root_only(
+            Path::new("/var/lib/vm/.restore-input"),
+            &denied
+        ));
+        let other = std::io::Error::from(std::io::ErrorKind::Other);
+        assert!(!staged_by_root_only(&staged, &other));
+    }
 
     #[test]
     fn checkpoints_are_written_as_dot_checkpoint_and_the_earlier_name_still_works() {
