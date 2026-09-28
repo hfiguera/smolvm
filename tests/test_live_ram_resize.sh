@@ -72,11 +72,11 @@ test "$final_sequence" -gt "$sequence"
 echo "linux_ram_growth_allocation_passed boot=$boot pid=$pid bytes=$bytes locked_kib=$locked block=$block"
 guest 'echo source >/dev/shm/lineage-marker; echo source >/storage/lineage-marker'
 mkdir -m 700 "$root/artifacts"
-machine checkpoint --name "$name" --output "$root/artifacts/grown.smolcheckpoint"
+machine checkpoint --name "$name" --output "$root/artifacts/grown.checkpoint"
 machine delete --name "$name" --force
 name="${name}-restored"
 owned_names=("$name")
-machine create --name "$name" --from "$root/artifacts/grown.smolcheckpoint"
+machine create --name "$name" --from "$root/artifacts/grown.checkpoint"
 machine start --name "$name" --branchable
 test "$(guest 'cat /proc/sys/kernel/random/boot_id')" = "$boot"
 read -r restored_pid restored_sequence restored_bytes <<<"$(guest 'cat /run/ram-probe-status')"
@@ -131,3 +131,27 @@ sleep 5
 read -r second_pid later_sequence second_bytes <<<"$(guest 'cat /run/ram-probe-status')"
 test "$later_sequence" -gt "$second_sequence"
 echo linux_grown_ram_restore_branch_independence_passed
+
+# Pause a fork clone whose RAM grew after it was restored. Pausing keeps the VM
+# stopped until its RAM is written, so the runtime reads the clone's
+# copy-on-write RAM in place, including the region added after restore.
+before_kib=$(guest "awk '/^MemTotal:/ {print \$2}' /proc/meminfo")
+machine resize --name "$name" --mem 1280
+after_kib=$(guest "awk '/^MemTotal:/ {print \$2}' /proc/meminfo")
+test "$after_kib" -gt "$((before_kib + 120 * 1024))"
+guest 'dd if=/dev/urandom of=/dev/shm/after-clone-growth bs=1048576 count=64'
+clone_hash=$(guest 'sha256sum /dev/shm/after-clone-growth' | awk '{print $1}')
+read -r paused_pid paused_sequence paused_bytes <<<"$(guest 'cat /run/ram-probe-status')"
+machine pause --name "$name"
+machine resume --name "$name"
+test "$(guest 'cat /proc/sys/kernel/random/boot_id')" = "$boot"
+test "$(guest "awk '/^MemTotal:/ {print \$2}' /proc/meminfo")" = "$after_kib"
+test "$(guest 'sha256sum /dev/shm/after-clone-growth' | awk '{print $1}')" = "$clone_hash"
+test "$(guest 'sha256sum /dev/shm/after-restore-growth' | awk '{print $1}')" = "$payload_hash"
+read -r resumed_pid resumed_sequence resumed_bytes <<<"$(guest 'cat /run/ram-probe-status')"
+test "$resumed_pid" = "$pid"
+test "$resumed_bytes" = "$paused_bytes"
+sleep 5
+read -r resumed_pid later_sequence resumed_bytes <<<"$(guest 'cat /run/ram-probe-status')"
+test "$later_sequence" -gt "$resumed_sequence"
+echo linux_grown_clone_pause_resume_passed
