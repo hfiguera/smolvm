@@ -1528,7 +1528,17 @@ fn capture_with_completion(
     // A capture that stops the VM keeps it paused until the RAM is written, so
     // libkrun can read RAM it cannot retain as a generation (a fork clone's)
     // in place instead of falling back to a synchronous save.
-    let command = if !use_deferred_save {
+    // A pause never resumes the source, so a VMM that reads a held guest's
+    // device windows in place can save a packed machine without the
+    // synchronous SAVE's extra copy. Older VMMs would rebase first, so packed
+    // machines use it only when the VMM says so.
+    let held_in_place = !use_deferred_save
+        && stop_after_capture
+        && crate::agent::fork::control_socket_cmd(&control, "SAVE_HELD_CAPABILITIES")
+            .is_ok_and(|reply| reply.trim() == "OK held-windows-in-place-v1");
+    let command = if held_in_place {
+        "PREPARE_SAVE_HELD"
+    } else if !use_deferred_save {
         "SAVE"
     } else if stop_after_capture {
         "PREPARE_SAVE_HELD"
@@ -1540,18 +1550,25 @@ fn capture_with_completion(
         &format!("{command} {}", runtime_snapshot.display()),
         std::time::Duration::from_secs(30 * 60),
     )?;
-    if command == "PREPARE_SAVE_HELD" && reply.trim() == "ERR EINVAL unknown command" {
+    if command == "PREPARE_SAVE_HELD"
+        && !held_in_place
+        && reply.trim() == "ERR EINVAL unknown command"
+    {
         reply = crate::agent::fork::control_socket_cmd_with_timeout(
             &control,
             &format!("PREPARE_SAVE {}", runtime_snapshot.display()),
             std::time::Duration::from_secs(30 * 60),
         )?;
     }
-    let prepared = use_deferred_save && reply.starts_with("OK");
+    let prepared = (use_deferred_save || held_in_place) && reply.starts_with("OK");
     tracing::info!(machine = name, command, reply = ?reply.trim(), "checkpoint memory protocol reply");
+    // A packed machine whose held save failed goes back to SAVE, never to the
+    // rebasing PREPARE_SAVE.
     if !prepared
-        && options.store_dir.is_none()
-        && (reply.starts_with("ERR ENOTSUP") || reply.trim() == "ERR EINVAL unknown command")
+        && (held_in_place
+            || (options.store_dir.is_none()
+                && (reply.starts_with("ERR ENOTSUP")
+                    || reply.trim() == "ERR EINVAL unknown command")))
     {
         reply = crate::agent::fork::control_socket_cmd_with_timeout(
             &control,
