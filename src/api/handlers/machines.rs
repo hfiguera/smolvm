@@ -3425,7 +3425,7 @@ async fn fork_machine_transaction(
     };
     let wait_ready = req.wait_ready || req_hold;
     let ready_timeout = std::time::Duration::from_secs(req.ready_timeout_secs.unwrap_or(240));
-    let fork_env = crate::util::parse_env_list(&req.env);
+    let fork_env = crate::util::parse_request_env_list(&req.env).map_err(ApiError::BadRequest)?;
     // Per-fork secrets become the clone's persisted secret_refs (resolved fresh
     // on each exec, never at rest) — validate them at TrustedLocal like the
     // Smolfile-declared refs they join.
@@ -3963,7 +3963,7 @@ pub async fn release_held_fork(
         )));
     }
 
-    let assignment = crate::util::parse_env_list(&req.env);
+    let assignment = crate::util::parse_request_env_list(&req.env).map_err(ApiError::BadRequest)?;
     crate::agent::fork::validate_fork_env(&assignment)
         .map_err(|e| ApiError::BadRequest(e.to_string()))?;
     let merged = crate::agent::fork::merge_fork_env(&record.fork_env, &assignment);

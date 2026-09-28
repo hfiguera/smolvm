@@ -811,7 +811,8 @@ async fn acquire_lease_inner(
     let worker_ready_timeout =
         validate_worker_ready_request(req.await_worker_ready, req.worker_ready_timeout_secs)?;
     let wait = validate_lease_wait(req.wait_secs)?;
-    let mut assignment = crate::util::parse_env_list(&req.env);
+    let mut assignment =
+        crate::util::parse_request_env_list(&req.env).map_err(ApiError::BadRequest)?;
     crate::agent::fork::validate_fork_env(&assignment)
         .map_err(|e| ApiError::BadRequest(e.to_string()))?;
     for reserved in RESERVED_LEASE_ENV {
