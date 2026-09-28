@@ -3384,6 +3384,13 @@ pub(crate) async fn fork_machine_inner(
     golden: String,
     req: ForkRequest,
 ) -> Result<MachineInfo, ApiError> {
+    if coalescable_branch(&req) {
+        return with_owned_operation(move |reply| async move {
+            state.queue_branch(&golden, crate::api::state::QueuedBranch { req, reply });
+            serve_queued_branches(state, golden).await;
+        })
+        .await;
+    }
     // A disconnected request must not drop lifecycle guards while its blocking
     // preparation still creates disks and registers the child. Once preparation
     // starts, finish boot or rollback before releasing those guards.
@@ -3392,6 +3399,201 @@ pub(crate) async fn fork_machine_inner(
         let _ = reply.send(outcome);
     })
     .await
+}
+
+/// Upper bound on the children of one branch batch that boot at once.
+const MAX_CONCURRENT_BRANCH_BOOTS: usize = 8;
+
+/// Whether a branch request can share its source's transaction with other
+/// requests queued for it. The children of a frozen source all restore its one
+/// retained checkpoint, so preparing them together changes nothing they
+/// inherit. Held pool slots and pinned ports keep the one-at-a-time path.
+fn coalescable_branch(req: &ForkRequest) -> bool {
+    req.freeze_source && !req.hold && req.ports.is_empty()
+}
+
+/// Take the source as a single branch does, then serve every compatible
+/// request queued for it, including those queued while it was busy (#1453).
+/// The source stays locked through preparation, boot and any rollback, as for
+/// a single branch; its children just boot together instead of one at a time.
+/// When another holder already served this request, nothing is left to do.
+async fn serve_queued_branches(state: Arc<ApiState>, golden: String) {
+    let golden_lifecycle = state.lifecycle_lock(&golden);
+    let _golden_guard = golden_lifecycle.lock().await;
+    let source_lock = acquire_fork_source_lock(golden.clone()).await;
+    loop {
+        let batch = state.take_branch_batch(&golden);
+        if batch.is_empty() {
+            return;
+        }
+        match &source_lock {
+            Ok(_) => branch_batch_transaction(&state, &golden, batch).await,
+            Err(error) => {
+                for queued in batch {
+                    let _ = queued.reply.send(Err(error.clone()));
+                }
+            }
+        }
+    }
+}
+
+/// Branch every request in `batch` from `golden`, whose locks the caller
+/// holds. Each request is checked on its own first, so an invalid one fails
+/// alone; the rest are prepared from one checkpoint and booted concurrently,
+/// and each request gets its own child's result.
+async fn branch_batch_transaction(
+    state: &Arc<ApiState>,
+    golden: &str,
+    batch: Vec<crate::api::state::QueuedBranch>,
+) {
+    let mut accepted = Vec::with_capacity(batch.len());
+    let mut names = std::collections::HashSet::new();
+    for queued in batch {
+        match check_queued_branch(state, golden, &queued.req, &mut names).await {
+            Ok(fork_env) => accepted.push((queued, fork_env)),
+            Err(error) => {
+                let _ = queued.reply.send(Err(error));
+            }
+        }
+    }
+    let Some((first, _)) = accepted.first() else {
+        return;
+    };
+    // The batch shares one forkpoint wait (`take_branch_batch` groups by it).
+    let wait_ready = first.req.wait_ready;
+    if wait_ready {
+        let timeout = Duration::from_secs(first.req.ready_timeout_secs.unwrap_or(240));
+        let golden_b = golden.to_string();
+        let waited = tokio::task::spawn_blocking(move || {
+            crate::agent::fork::wait_for_forkpoint(&golden_b, timeout)
+        })
+        .await
+        .map_err(|e| ApiError::internal(format!("task error: {e}")))
+        .and_then(|result| result.map_err(classify_fork_error));
+        if let Err(error) = waited {
+            for (queued, _) in accepted {
+                let _ = queued.reply.send(Err(error.clone()));
+            }
+            return;
+        }
+    }
+
+    // Lock every child's lifecycle, in name order, as a single branch does.
+    let mut lock_names: Vec<String> = accepted.iter().map(|(q, _)| q.req.name.clone()).collect();
+    lock_names.sort();
+    let mut guards = Vec::with_capacity(lock_names.len());
+    for name in &lock_names {
+        guards.push(state.lifecycle_lock(name).lock_owned().await);
+    }
+    // A request cancelled while queued has nothing prepared yet.
+    accepted.retain(|(queued, _)| !queued.reply.is_closed());
+    if accepted.is_empty() {
+        return;
+    }
+
+    let prepared = {
+        let db = state.db().clone();
+        let golden_b = golden.to_string();
+        let children: Vec<_> = accepted
+            .iter()
+            .map(|(queued, fork_env)| {
+                (
+                    queued.req.name.clone(),
+                    queued.req.forkable,
+                    fork_env.clone(),
+                    queued.req.secrets.clone(),
+                )
+            })
+            .collect();
+        tokio::task::spawn_blocking(move || {
+            let specs: Vec<_> = children
+                .iter()
+                .map(
+                    |(clone, forkable, fork_env, secrets)| crate::agent::fork::ForkSpec {
+                        clone,
+                        pinned_ports: &[],
+                        clone_forkable: *forkable,
+                        fork_env,
+                        fork_secrets: secrets,
+                        hold: false,
+                    },
+                )
+                .collect();
+            crate::agent::fork::prepare_forks(
+                &db,
+                &golden_b,
+                &specs,
+                crate::agent::fork::ForkSourcePolicy::Freeze,
+            )
+        })
+        .await
+        .map_err(|e| ApiError::internal(format!("task error: {e}")))
+        .and_then(|result| result.map_err(classify_fork_error))
+    };
+    let forks = match prepared {
+        Ok(forks) => forks,
+        Err(error) => {
+            for (queued, _) in accepted {
+                let _ = queued.reply.send(Err(error.clone()));
+            }
+            return;
+        }
+    };
+
+    let boots = forks
+        .into_iter()
+        .zip(accepted)
+        .map(|(prep, (queued, fork_env))| {
+            let state = state.clone();
+            async move {
+                let result = boot_prepared_fork_inner(
+                    state,
+                    queued.req.name.clone(),
+                    prep,
+                    PreparedForkBoot {
+                        share_weights: queued.req.share_weights,
+                        fork_env,
+                        wait_ready,
+                        hold: false,
+                        cuda_worker_ready_timeout: None,
+                        boot_permit: None,
+                    },
+                )
+                .await;
+                let succeeded = result.is_ok();
+                let _ = queued.reply.send(result);
+                succeeded
+            }
+        });
+    run_bounded_futures(boots, MAX_CONCURRENT_BRANCH_BOOTS, |succeeded| succeeded).await;
+    drop(guards);
+}
+
+/// The checks a single branch makes before preparing its child. Returns the
+/// child's parsed environment. `names` collects the batch's child names.
+async fn check_queued_branch(
+    state: &ApiState,
+    golden: &str,
+    req: &ForkRequest,
+    names: &mut std::collections::HashSet<String>,
+) -> Result<Vec<(String, String)>, ApiError> {
+    crate::api::handlers::validate_fork_secrets(&req.secrets)?;
+    let fork_env = crate::util::parse_request_env_list(&req.env).map_err(ApiError::BadRequest)?;
+    crate::agent::fork::validate_fork_env(&fork_env)
+        .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    if req.name == golden {
+        return Err(ApiError::Conflict(format!(
+            "clone name '{}' is already used by the golden",
+            req.name
+        )));
+    }
+    if !names.insert(req.name.clone()) || state.lookup_vm(&req.name).await?.is_some() {
+        return Err(ApiError::Conflict(format!(
+            "machine '{}' already exists",
+            req.name
+        )));
+    }
+    Ok(fork_env)
 }
 
 async fn with_owned_operation<T, F, Fut>(work: F) -> Result<T, ApiError>

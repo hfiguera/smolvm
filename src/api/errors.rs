@@ -9,7 +9,7 @@ use serde::Serialize;
 use std::fmt::Display;
 
 /// API error type with HTTP status code mapping.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum ApiError {
     /// Missing or invalid authentication credentials (401).
     Unauthorized(String),

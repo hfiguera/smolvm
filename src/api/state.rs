@@ -95,6 +95,10 @@ pub struct ApiState {
     /// deleted name is negligible, and never removing avoids handing two callers
     /// different mutexes for the same name (which would defeat the exclusion).
     lifecycle_locks: RwLock<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    /// Branch requests waiting for their source, by source name. Whoever next
+    /// holds a source serves every compatible request queued by then in one
+    /// transaction, so their children boot together (see `branch_machine`).
+    branch_queues: parking_lot::Mutex<HashMap<String, Vec<QueuedBranch>>>,
     /// Database for persistent state.
     db: SmolvmDb,
     /// Previous CPU samples per VM PID, used to compute the fractional-CPU
@@ -316,6 +320,7 @@ impl ApiState {
             machines: RwLock::new(BTreeMap::new()),
             reserved_names: RwLock::new(HashSet::new()),
             lifecycle_locks: RwLock::new(HashMap::new()),
+            branch_queues: parking_lot::Mutex::new(HashMap::new()),
             db,
             cpu_samples: parking_lot::Mutex::new(HashMap::new()),
             started_at: std::time::Instant::now(),
@@ -335,6 +340,7 @@ impl ApiState {
             machines: RwLock::new(BTreeMap::new()),
             reserved_names: RwLock::new(HashSet::new()),
             lifecycle_locks: RwLock::new(HashMap::new()),
+            branch_queues: parking_lot::Mutex::new(HashMap::new()),
             db,
             cpu_samples: parking_lot::Mutex::new(HashMap::new()),
             started_at: std::time::Instant::now(),
@@ -644,6 +650,39 @@ impl ApiState {
             .get(name)
             .cloned()
             .ok_or_else(|| ApiError::NotFound(format!("machine '{}' not found", name)))
+    }
+
+    /// Queue a branch request for `source`, to be answered through its reply.
+    pub(crate) fn queue_branch(&self, source: &str, branch: QueuedBranch) {
+        self.branch_queues
+            .lock()
+            .entry(source.to_string())
+            .or_default()
+            .push(branch);
+    }
+
+    /// Take the queued branch requests for `source` that can share one
+    /// transaction with the oldest one: those that wait for the same forkpoint.
+    /// Returns an empty batch when nothing is queued.
+    pub(crate) fn take_branch_batch(&self, source: &str) -> Vec<QueuedBranch> {
+        let mut queues = self.branch_queues.lock();
+        let Some(queue) = queues.get_mut(source) else {
+            return Vec::new();
+        };
+        let Some(first) = queue.first() else {
+            queues.remove(source);
+            return Vec::new();
+        };
+        let key = (first.req.wait_ready, first.req.ready_timeout_secs);
+        let (batch, rest): (Vec<_>, Vec<_>) = std::mem::take(queue)
+            .into_iter()
+            .partition(|queued| (queued.req.wait_ready, queued.req.ready_timeout_secs) == key);
+        if rest.is_empty() {
+            queues.remove(source);
+        } else {
+            *queue = rest;
+        }
+        batch
     }
 
     /// Get the per-machine lifecycle lock for `name`, creating it on first use.
@@ -1402,6 +1441,12 @@ pub fn build_launch_features(
     Ok(features)
 }
 
+/// A branch request waiting for its source, and where to send its answer.
+pub(crate) struct QueuedBranch {
+    pub(crate) req: crate::api::types::ForkRequest,
+    pub(crate) reply: tokio::sync::oneshot::Sender<Result<MachineInfo, ApiError>>,
+}
+
 /// Ensure a machine is running, starting it if needed.
 ///
 /// This is the shared preflight check used by exec, container, and image handlers.
@@ -1886,6 +1931,37 @@ mod tests {
         let path = dir.path().join("test.db");
         let db = SmolvmDb::open_at(&path).unwrap();
         (dir, ApiState::with_db(db))
+    }
+
+    /// Queued branches of one source are served in batches of those that wait
+    /// for the same forkpoint, oldest first; other sources are untouched.
+    #[test]
+    fn queued_branches_batch_by_forkpoint_wait() {
+        let (_dir, state) = temp_api_state();
+        let mut replies = Vec::new();
+        let mut queue = |source: &str, name: &str, wait_ready: bool| {
+            let req: crate::api::types::ForkRequest = serde_json::from_value(serde_json::json!({
+                "name": name,
+                "freezeSource": true,
+                "waitReady": wait_ready,
+            }))
+            .unwrap();
+            let (reply, receiver) = tokio::sync::oneshot::channel();
+            replies.push(receiver);
+            state.queue_branch(source, QueuedBranch { req, reply });
+        };
+        queue("src", "a", false);
+        queue("src", "b", true);
+        queue("src", "c", false);
+        queue("other", "d", false);
+        let names = |batch: Vec<QueuedBranch>| -> Vec<String> {
+            batch.into_iter().map(|queued| queued.req.name).collect()
+        };
+        assert_eq!(names(state.take_branch_batch("src")), ["a", "c"]);
+        assert_eq!(names(state.take_branch_batch("src")), ["b"]);
+        assert!(state.take_branch_batch("src").is_empty());
+        assert!(!state.branch_queues.lock().contains_key("src"));
+        assert_eq!(names(state.take_branch_batch("other")), ["d"]);
     }
 
     #[test]
