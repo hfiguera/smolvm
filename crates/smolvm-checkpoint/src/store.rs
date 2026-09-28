@@ -501,7 +501,7 @@ impl Writer {
             .write(true)
             .create_new(true)
             .open(directory.join(INDEX))?;
-        serde_json::to_writer(&mut file, &index)?;
+        file.write_all(&serde_json::to_vec(&index)?)?;
         file.sync_all()?;
         File::open(&self.objects)?.sync_all()?;
         File::open(&self.cache)?.sync_all()?;
@@ -860,7 +860,7 @@ pub fn record_lineage(store: &Path, record: &LineageRecord) -> io::Result<()> {
     let temp = dir.join(format!(".{}.json.tmp", record.id));
     {
         let mut file = File::create(&temp)?;
-        serde_json::to_writer(&mut file, record)?;
+        file.write_all(&serde_json::to_vec(record)?)?;
         file.sync_all()?;
     }
     fs::rename(&temp, &final_path)?;
@@ -899,8 +899,8 @@ pub fn find_lineage(store: &Path, id: &str) -> io::Result<Option<LineageRecord>>
         return Ok(None);
     }
     let path = store.join(LINEAGE_DIR).join(format!("{id}.json"));
-    match File::open(&path) {
-        Ok(file) => Ok(Some(serde_json::from_reader(file)?)),
+    match fs::read(&path) {
+        Ok(bytes) => Ok(Some(serde_json::from_slice(&bytes)?)),
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(e),
     }
@@ -920,7 +920,7 @@ pub fn list_lineage(store: &Path) -> io::Result<Vec<LineageRecord>> {
         if !name.ends_with(".json") || name.starts_with('.') {
             continue;
         }
-        if let Ok(record) = serde_json::from_reader::<_, LineageRecord>(File::open(entry.path())?) {
+        if let Ok(record) = serde_json::from_slice::<LineageRecord>(&fs::read(entry.path())?) {
             records.push(record);
         }
     }
@@ -1393,7 +1393,10 @@ fn read_index_from(path: &Path) -> io::Result<Index> {
     if fs::symlink_metadata(path)?.len() > 256 * 1024 * 1024 {
         return Err(invalid("checkpoint index too large"));
     }
-    let index: Index = serde_json::from_reader(File::open(path)?)?;
+    // Parse from memory: serde_json reading straight from an unbuffered File
+    // issues one read() per byte, and every save re-reads each retained
+    // generation's index, so that made each save slower than the last.
+    let index: Index = serde_json::from_slice(&fs::read(path)?)?;
     validate_index(&index)?;
     Ok(index)
 }
