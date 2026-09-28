@@ -341,6 +341,15 @@ pub struct LaunchFeatures {
 /// dir survives but whose `layers/` is missing or holds no layer dirs would boot
 /// an empty `/packed_layers` and make the guest fail "no layer directories
 /// found"; this drives the self-heal re-extract in `with_packed_layers`.
+/// Whether the pack at `sidecar` carries OCI image layers. Reads only its
+/// manifest. When the manifest can't be read, assume it does, so the launch
+/// self-heal still gets its chance (it is best-effort and reports failures).
+fn pack_has_image_layers(sidecar: &Path) -> bool {
+    smolvm_pack::packer::read_manifest_from_sidecar(sidecar)
+        .map(|manifest| !manifest.assets.layers.is_empty())
+        .unwrap_or(true)
+}
+
 fn shared_layers_populated(layers: &Path) -> bool {
     std::fs::read_dir(layers)
         .map(|rd| rd.flatten().any(|e| e.path().is_dir()))
@@ -444,7 +453,12 @@ impl LaunchFeatures {
             // cheap no-op via the `.smolvm-extracted` marker). Best-effort: if the
             // sidecar is gone we proceed and surface the original error rather than
             // masking it.
-            if !shared_layers_populated(&layers) {
+            //
+            // A VM-mode pack carries disks, not image layers, so its `layers/`
+            // is empty by design: only a pack that has layers can have lost them.
+            // Without this check every launch of a VM-mode machine (each start,
+            // each branch child) re-ran the extraction and its full-pack digest.
+            if !shared_layers_populated(&layers) && pack_has_image_layers(Path::new(sidecar_path)) {
                 let sidecar = Path::new(sidecar_path);
                 if sidecar.exists() {
                     if let Ok(footer) = smolvm_pack::packer::read_footer_from_sidecar(sidecar) {
@@ -2808,6 +2822,28 @@ fn spawn_idle_reclaim(ctl: PathBuf, memory_mib: u32, idle_minutes: u64) {
 
 #[cfg(test)]
 mod tests {
+    /// A VM-mode pack has no image layers, so launching its machines must not
+    /// treat the empty `layers/` as evicted and re-extract the pack (#1454).
+    #[test]
+    fn layerless_packs_skip_the_launch_self_heal() {
+        let dir = tempfile::tempdir().unwrap();
+        let pack = dir.path().join("vm.smolmachine");
+        let manifest = smolvm_pack::format::PackManifest::new(
+            "vm://saved".into(),
+            "none".into(),
+            "linux/amd64".into(),
+            "linux/amd64".into(),
+        );
+        smolvm_pack::packer::Packer::new(manifest)
+            .pack_artifact_with_identity(&pack)
+            .unwrap();
+        assert!(!super::pack_has_image_layers(&pack));
+        // An unreadable pack keeps the best-effort self-heal.
+        assert!(super::pack_has_image_layers(
+            &dir.path().join("missing.smolmachine")
+        ));
+    }
+
     use super::*;
     use std::fs;
 
