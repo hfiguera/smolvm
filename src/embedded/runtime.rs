@@ -56,6 +56,17 @@ impl EmbeddedRuntime {
         })
     }
 
+    /// Replace a stopped machine's outbound network policy, for example to
+    /// give a machine restored from a shared checkpoint its own allow list
+    /// before it first boots. See [`crate::config::VmRecord::apply_egress_policy`].
+    pub fn set_egress_policy(
+        &self,
+        name: &str,
+        policy: &crate::data::network::EgressPolicy,
+    ) -> Result<()> {
+        self.with_name_lock(name, || control::set_egress_policy(&self.db, name, policy))
+    }
+
     /// Capture a running checkpointable machine into a portable artifact.
     ///
     /// The source resumes as soon as its consistent RAM/disk boundary is

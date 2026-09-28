@@ -135,6 +135,31 @@ pub(crate) fn create_vm_with_workload(
     }
 }
 
+/// Replace a stopped machine's outbound network policy. See
+/// [`VmRecord::apply_egress_policy`] for what may change.
+pub fn set_egress_policy(
+    db: &SmolvmDb,
+    name: &str,
+    policy: &crate::data::network::EgressPolicy,
+) -> Result<()> {
+    let record = get_record(db, name)?;
+    let state = record.actual_state();
+    if !matches!(state, RecordState::Stopped | RecordState::Created) {
+        return Err(Error::InvalidState {
+            expected: "stopped".into(),
+            actual: format!("{state:?}"),
+        });
+    }
+    let mut updated = record;
+    updated.apply_egress_policy(policy)?;
+    db.update_vm(name, |r| {
+        r.network = updated.network;
+        r.allowed_cidrs = updated.allowed_cidrs.clone();
+        r.dns_filter_hosts = updated.dns_filter_hosts.clone();
+    })?;
+    Ok(())
+}
+
 /// Load a persisted VM record.
 pub fn get_record(db: &SmolvmDb, name: &str) -> Result<VmRecord> {
     db.get_vm(name)?.ok_or_else(|| Error::vm_not_found(name))

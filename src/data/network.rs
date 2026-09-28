@@ -1,4 +1,5 @@
 use ipnet::IpNet;
+use serde::{Deserialize, Serialize};
 use std::net::{IpAddr, Ipv4Addr};
 
 /// Fallback DNS server (Cloudflare) used when the host's resolver cannot be detected.
@@ -431,5 +432,56 @@ mod tests {
             "10.0.0.0/8".into()
         ]));
         assert!(!cidrs_all_loopback(&["0.0.0.0/0".into()]));
+    }
+}
+
+/// A machine's outbound network policy, as it can be set on a stopped machine.
+///
+/// `hosts` entries are exact host names (`api.github.com`) or subdomain
+/// wildcards (`*.github.com`, which does not match `github.com` itself); they
+/// are enforced by the host-side DNS filter. `cidrs` restrict egress by address.
+/// With both empty and `network` set, egress is open.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EgressPolicy {
+    /// Outbound network access at all.
+    pub network: bool,
+    /// Addresses the machine may reach; empty means no address restriction.
+    #[serde(default)]
+    pub cidrs: Vec<String>,
+    /// Host names the machine may reach; empty means no name restriction.
+    #[serde(default)]
+    pub hosts: Vec<String>,
+}
+
+/// Loopback only: every external destination is refused. This is how
+/// `--outbound-localhost-only` is stored, and it keeps the network device a
+/// machine was checkpointed with, unlike turning networking off.
+pub const DENY_ALL_CIDRS: [&str; 2] = ["127.0.0.0/8", "::1/128"];
+
+impl EgressPolicy {
+    /// Unrestricted outbound access.
+    pub fn allow_all() -> Self {
+        Self {
+            network: true,
+            ..Self::default()
+        }
+    }
+
+    /// No external destinations, with the network device kept in place.
+    pub fn deny_all() -> Self {
+        Self {
+            network: true,
+            cidrs: DENY_ALL_CIDRS.iter().map(|c| c.to_string()).collect(),
+            hosts: Vec::new(),
+        }
+    }
+
+    /// Only these host names (exact, or `*.` subdomain wildcards).
+    pub fn hosts<I: IntoIterator<Item = S>, S: Into<String>>(hosts: I) -> Self {
+        Self {
+            network: true,
+            cidrs: Vec::new(),
+            hosts: hosts.into_iter().map(Into::into).collect(),
+        }
     }
 }

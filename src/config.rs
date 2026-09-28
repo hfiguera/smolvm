@@ -1081,6 +1081,77 @@ impl VmRecord {
         Ok(())
     }
 
+    /// Replace this machine's outbound network policy. The machine must be
+    /// stopped; the caller persists the record.
+    ///
+    /// Host names are stored in the strict form (`api.github.com` exact,
+    /// `*.github.com` subdomains only) and CIDRs normalized, with the same
+    /// validation create applies. A credential binding must stay reachable under
+    /// the new host list.
+    ///
+    /// A machine that resumes saved memory on its next start (restored from a
+    /// checkpoint, or paused) keeps the network device it was saved with, so a
+    /// policy that would need a different network backend is refused rather than
+    /// booting a guest whose devices changed underneath it. Changing which
+    /// hosts or addresses are allowed never needs one on such a machine: its
+    /// backend is pinned.
+    pub fn apply_egress_policy(&mut self, policy: &network::EgressPolicy) -> Result<()> {
+        let cidrs = policy
+            .cidrs
+            .iter()
+            .map(|cidr| crate::smolfile::parse_cidr(cidr))
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|reason| crate::Error::config("egress policy", reason))?;
+        let hosts = policy
+            .hosts
+            .iter()
+            .map(|host| smolvm_protocol::host_pattern::encode_strict(host.trim()))
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|reason| crate::Error::config("egress policy", reason))?;
+
+        let mut next = self.clone();
+        next.network = policy.network;
+        next.allowed_cidrs = (!cidrs.is_empty()).then_some(cidrs);
+        next.dns_filter_hosts = (!hosts.is_empty()).then_some(hosts);
+        if let Some(credentials) = next.credential_policy.as_ref() {
+            credentials
+                .validate(next.dns_filter_hosts.as_deref())
+                .map_err(|e| crate::Error::config("egress policy", e.to_string()))?;
+        }
+        let resumes_saved_memory =
+            self.paused_checkpoint.is_some() || self.checkpoint_head.is_some();
+        let before = self.launch_network_plan().backend;
+        let after = next.launch_network_plan().backend;
+        // An allow list (deny-all included) is enforced by virtio-net's
+        // host-side stack only; on TSI it would be silently unenforced. A
+        // machine pinned to TSI (explicitly, or by a checkpoint it resumes)
+        // cannot take one.
+        let restricted = next.allowed_cidrs.is_some() || next.dns_filter_hosts.is_some();
+        if restricted && after == crate::network::EffectiveNetworkBackend::Tsi {
+            return Err(crate::Error::config(
+                "egress policy",
+                format!(
+                    "machine '{}' uses TSI networking, which cannot enforce an allow list; \
+                     create it (or the machine its checkpoint came from) with the virtio-net backend",
+                    self.name
+                ),
+            ));
+        }
+        if resumes_saved_memory && before != after {
+            return Err(crate::Error::config(
+                "egress policy",
+                format!(
+                    "machine '{}' resumes saved memory that was taken with {before:?} networking, \
+                     and this policy needs {after:?}; keep networking on (use a deny-all policy \
+                     rather than turning the network off), or recreate the machine",
+                    self.name
+                ),
+            ));
+        }
+        *self = next;
+        Ok(())
+    }
+
     /// The network this machine launches with. A credential policy steers the
     /// default backend to virtio-net, so anything that records or checks the
     /// backend (validation, checkpoint capture) must plan it the same way the
@@ -1787,5 +1858,138 @@ mod tests {
             back.vm_resources().effective_gpu_vram_mib(),
             crate::data::resources::DEFAULT_GPU_VRAM_MIB,
         );
+    }
+
+    fn networked(name: &str) -> VmRecord {
+        VmRecord::new(name.into(), 1, 512, vec![], vec![], true)
+    }
+
+    #[test]
+    fn an_egress_policy_stores_strict_hosts_and_normalized_cidrs() {
+        let mut record = networked("hosts");
+        record
+            .apply_egress_policy(&network::EgressPolicy::hosts([
+                "github.com",
+                "*.github.com",
+            ]))
+            .unwrap();
+        assert_eq!(
+            record.dns_filter_hosts,
+            Some(vec!["=github.com".to_string(), "*.github.com".to_string()])
+        );
+        assert_eq!(record.allowed_cidrs, None);
+        assert!(record.network);
+
+        record
+            .apply_egress_policy(&network::EgressPolicy::deny_all())
+            .unwrap();
+        assert_eq!(record.dns_filter_hosts, None);
+        assert_eq!(
+            record.allowed_cidrs,
+            Some(vec!["127.0.0.0/8".to_string(), "::1/128".to_string()])
+        );
+
+        record
+            .apply_egress_policy(&network::EgressPolicy::allow_all())
+            .unwrap();
+        assert_eq!(
+            (
+                record.allowed_cidrs.clone(),
+                record.dns_filter_hosts.clone()
+            ),
+            (None, None)
+        );
+    }
+
+    #[test]
+    fn an_invalid_host_or_cidr_leaves_the_record_untouched() {
+        let mut record = networked("invalid");
+        record
+            .apply_egress_policy(&network::EgressPolicy::hosts(["example.com"]))
+            .unwrap();
+        let before = record.clone();
+        for bad in [
+            network::EgressPolicy::hosts(["not a host"]),
+            network::EgressPolicy {
+                network: true,
+                cidrs: vec!["10.0.0.0/33".into()],
+                hosts: vec![],
+            },
+        ] {
+            assert!(record.apply_egress_policy(&bad).is_err());
+            assert_eq!(record.dns_filter_hosts, before.dns_filter_hosts);
+            assert_eq!(record.allowed_cidrs, before.allowed_cidrs);
+        }
+    }
+
+    #[test]
+    fn a_machine_resuming_saved_memory_keeps_its_network_device() {
+        // Restored from a checkpoint taken with virtio-net: the backend is
+        // pinned, so any allow list is fine, but turning networking off would
+        // remove the device the saved guest expects.
+        let mut restored = networked("restored");
+        restored.network_backend = Some(NetworkBackend::VirtioNet);
+        restored.checkpoint_head = Some("gen-1".into());
+        restored
+            .apply_egress_policy(&network::EgressPolicy::hosts(["api.github.com"]))
+            .unwrap();
+        restored
+            .apply_egress_policy(&network::EgressPolicy::deny_all())
+            .unwrap();
+        restored
+            .apply_egress_policy(&network::EgressPolicy::allow_all())
+            .unwrap();
+        let err = restored
+            .apply_egress_policy(&network::EgressPolicy::default())
+            .unwrap_err();
+        assert!(err.to_string().contains("resumes saved memory"), "{err}");
+        assert!(restored.network, "a refused policy changes nothing");
+
+        // Saved with TSI (the outbound-only default), an allow list would need
+        // virtio-net: refused. A machine with no saved memory may switch.
+        let mut tsi = networked("tsi");
+        tsi.paused_checkpoint = Some("saved.smolcheckpoint".into());
+        assert!(tsi
+            .apply_egress_policy(&network::EgressPolicy::hosts(["example.com"]))
+            .is_err());
+        // Restored from a TSI checkpoint, the backend is pinned to TSI, which
+        // cannot enforce an allow list or deny-all: refused, not silently open.
+        let mut pinned_tsi = networked("pinned-tsi");
+        pinned_tsi.network_backend = Some(NetworkBackend::Tsi);
+        pinned_tsi.checkpoint_head = Some("gen-1".into());
+        for policy in [
+            network::EgressPolicy::hosts(["example.com"]),
+            network::EgressPolicy::deny_all(),
+        ] {
+            let err = pinned_tsi.apply_egress_policy(&policy).unwrap_err();
+            assert!(
+                err.to_string().contains("cannot enforce an allow list"),
+                "{err}"
+            );
+        }
+        pinned_tsi
+            .apply_egress_policy(&network::EgressPolicy::allow_all())
+            .unwrap();
+        let mut fresh = networked("fresh");
+        fresh
+            .apply_egress_policy(&network::EgressPolicy::hosts(["example.com"]))
+            .unwrap();
+    }
+
+    #[test]
+    fn a_credential_host_must_stay_reachable_under_a_new_allow_list() {
+        let mut record = networked("credentialed");
+        record.credential_policy = Some(
+            serde_json::from_str(
+                r#"{"credentials":[{"name":"gh","environment_variable":"GH_TOKEN","allowed_hosts":["api.github.com"]}]}"#,
+            )
+            .unwrap(),
+        );
+        record
+            .apply_egress_policy(&network::EgressPolicy::hosts(["*.github.com"]))
+            .unwrap();
+        assert!(record
+            .apply_egress_policy(&network::EgressPolicy::hosts(["example.com"]))
+            .is_err());
     }
 }
