@@ -619,6 +619,13 @@ impl PackRunCmd {
 
         let console_log_path = runtime_dir.path().join("console.log");
 
+        // Watched from the parent, which owns the run: a forked child can't use
+        // the macOS watcher (#1192).
+        #[cfg(unix)]
+        let watched_mounts = watched_packed_mounts(&packed_mounts);
+        // The CLI as the forked VM child will see its parent (#1193).
+        #[cfg(unix)]
+        let cli_pid = std::process::id() as smolvm::process::Pid;
         #[cfg(unix)]
         let child_pid = {
             let vsock_path_clone = vsock_path.clone();
@@ -628,6 +635,11 @@ impl PackRunCmd {
                 .as_ref()
                 .and_then(|policy| policy.dns_filter_hosts.clone());
             smolvm::process::fork_session_leader(move || {
+                // A foreground run's VM ends with the CLI, however the CLI ends:
+                // Ctrl-C reaches only the CLI, since this child leads its own
+                // session, and a signal skips the CLI's cleanup (#1193).
+                smolvm::process::exit_when_parent_is_not(cli_pid);
+
                 // Child process: load libkrun via dlopen and launch VM
                 let krun = match unsafe { KrunFunctions::load(&lib_dir) } {
                     Ok(k) => k,
@@ -661,15 +673,6 @@ impl PackRunCmd {
                 // steal keystrokes or corrupt terminal state.
                 detach_vm_child_stdio();
 
-                let _fsnotify_watcher = smolvm::agent::FsNotifyWatcher::start_tagged(
-                    config.vsock_socket.to_path_buf(),
-                    config
-                        .mounts
-                        .iter()
-                        .filter(|mount| !mount.staged)
-                        .map(|mount| (PathBuf::from(&mount.host_path), mount.tag.clone())),
-                );
-
                 if let Err(e) = launch_agent_vm_dynamic(&krun, &config) {
                     let msg = format!("launch_agent_vm_dynamic failed: {}\n", e);
                     let _ = std::fs::write(&config.console_log, &msg);
@@ -679,6 +682,9 @@ impl PackRunCmd {
             })
             .map_err(|e| Error::agent("fork VM process", e.to_string()))?
         };
+        #[cfg(unix)]
+        let _fsnotify_watcher =
+            smolvm::agent::FsNotifyWatcher::start_tagged(vsock_path.clone(), watched_mounts);
 
         #[cfg(not(unix))]
         let child_pid = {
@@ -851,6 +857,17 @@ impl PackRunCmd {
         drop(layers_lease); // releases layers volume lease (detaches if last)
         std::process::exit(exit_code);
     }
+}
+
+/// The `(host path, virtiofs tag)` of every live-coherent mount, for the
+/// host-to-guest change watcher. Staged mounts have no live coherence.
+#[cfg(unix)]
+fn watched_packed_mounts(mounts: &[PackedMount]) -> Vec<(PathBuf, String)> {
+    mounts
+        .iter()
+        .filter(|mount| !mount.staged)
+        .map(|mount| (PathBuf::from(&mount.host_path), mount.tag.clone()))
+        .collect()
 }
 
 /// RAII guard that terminates the VM child process and cleans up the
@@ -1787,8 +1804,16 @@ fn run_from_cache(
 
     let console_log_path = runtime_dir.path().join("console.log");
     let vsock_path_clone = vsock_path.clone();
+    // As in a packed `run`: the parent watches mounts (#1192) and the child
+    // ends with the CLI (#1193).
+    #[cfg(unix)]
+    let watched_mounts = watched_packed_mounts(&packed_mounts);
+    #[cfg(unix)]
+    let cli_pid = std::process::id() as smolvm::process::Pid;
     #[cfg(unix)]
     let child_pid = smolvm::process::fork_session_leader(move || {
+        smolvm::process::exit_when_parent_is_not(cli_pid);
+
         let krun = match unsafe { KrunFunctions::load(&lib_dir) } {
             Ok(k) => k,
             Err(e) => {
@@ -1821,15 +1846,6 @@ fn run_from_cache(
         // steal keystrokes or corrupt terminal state.
         detach_vm_child_stdio();
 
-        let _fsnotify_watcher = smolvm::agent::FsNotifyWatcher::start_tagged(
-            config.vsock_socket.to_path_buf(),
-            config
-                .mounts
-                .iter()
-                .filter(|mount| !mount.staged)
-                .map(|mount| (PathBuf::from(&mount.host_path), mount.tag.clone())),
-        );
-
         if let Err(e) = launch_agent_vm_dynamic(&krun, &config) {
             let msg = format!("launch_agent_vm_dynamic failed: {}\n", e);
             let _ = std::fs::write(&config.console_log, &msg);
@@ -1837,6 +1853,9 @@ fn run_from_cache(
         smolvm::process::exit_child(1);
     })
     .map_err(|e| Error::agent("fork VM process", e.to_string()))?;
+    #[cfg(unix)]
+    let _fsnotify_watcher =
+        smolvm::agent::FsNotifyWatcher::start_tagged(vsock_path.clone(), watched_mounts);
 
     // Windows has no fork(): re-spawn this executable as `_boot-vm <config>`,
     // mirroring the non-packed launcher and the `--sidecar` path. BootConfig
@@ -2282,7 +2301,9 @@ fn daemon_start(
         // keystrokes from the user's shell.
         detach_vm_child_stdio();
 
-        let _fsnotify_watcher = smolvm::agent::FsNotifyWatcher::start_tagged(
+        // The daemon outlives the CLI, so it watches its own mounts, with a
+        // watcher that works in a forked child on macOS (#1192).
+        let _fsnotify_watcher = smolvm::agent::FsNotifyWatcher::start_tagged_after_fork(
             config.vsock_socket.to_path_buf(),
             config
                 .mounts

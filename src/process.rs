@@ -3359,6 +3359,25 @@ pub fn detach_stdio_to_stderr_file(path: &std::path::Path) -> std::io::Result<()
     Ok(())
 }
 
+/// Exit this process once `parent` is no longer its parent.
+///
+/// When the parent dies, the kernel reparents this process (to init, launchd
+/// or a subreaper), so `getppid()` stops matching. A thread polls for that and
+/// exits, taking a VM this process runs down with it. Pass the parent's pid as
+/// the parent saw it before forking: a parent that dies before the first poll
+/// is still caught. Uses only `getppid` and `nanosleep`.
+#[cfg(unix)]
+pub fn exit_when_parent_is_not(parent: Pid) {
+    let _ = std::thread::Builder::new()
+        .name("parent-death-watch".into())
+        .spawn(move || loop {
+            if unsafe { libc::getppid() } != parent {
+                exit_child(0);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(500));
+        });
+}
+
 /// Exit the current process immediately without cleanup.
 ///
 /// On Unix this is a safe wrapper around `libc::_exit()` for use in forked
@@ -3562,6 +3581,37 @@ extern "C" fn sigint_kill_handler(_sig: libc::c_int) {
 
 #[cfg(test)]
 mod tests {
+    /// A forked child that watches for a parent it doesn't have exits at once
+    /// (its parent is gone, as far as it can tell); one watching its real
+    /// parent keeps running (#1193).
+    #[cfg(unix)]
+    #[test]
+    fn a_child_exits_when_its_parent_is_gone() {
+        let run_child = |watched: Pid| -> (i32, std::time::Duration) {
+            let started = std::time::Instant::now();
+            let pid = unsafe { libc::fork() };
+            assert!(pid >= 0);
+            if pid == 0 {
+                exit_when_parent_is_not(watched);
+                std::thread::sleep(std::time::Duration::from_millis(1500));
+                exit_child(3);
+            }
+            let mut status = 0;
+            assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
+            assert!(libc::WIFEXITED(status));
+            (libc::WEXITSTATUS(status), started.elapsed())
+        };
+        let me = std::process::id() as Pid;
+        let (code, elapsed) = run_child(me.wrapping_add(1_000_000));
+        assert_eq!(code, 0, "watchdog exit");
+        assert!(
+            elapsed < std::time::Duration::from_millis(1000),
+            "{elapsed:?}"
+        );
+        let (code, _) = run_child(me);
+        assert_eq!(code, 3, "a child whose parent lives runs to its own end");
+    }
+
     use super::*;
 
     #[test]

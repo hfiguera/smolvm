@@ -105,15 +105,7 @@ pub fn run(config_path: PathBuf) -> crate::Result<()> {
     // a Unix concern here).
     #[cfg(unix)]
     if std::env::var_os("SMOLVM_BOOT_WATCH_PARENT").as_deref() == Some(std::ffi::OsStr::new("1")) {
-        let original_ppid = unsafe { libc::getppid() };
-        let _ = std::thread::Builder::new()
-            .name("parent-death-watch".into())
-            .spawn(move || loop {
-                std::thread::sleep(std::time::Duration::from_millis(500));
-                if unsafe { libc::getppid() } != original_ppid {
-                    crate::process::exit_child(0);
-                }
-            });
+        crate::process::exit_when_parent_is_not(unsafe { libc::getppid() });
     }
 
     // Read boot config

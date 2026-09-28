@@ -95,6 +95,26 @@ impl FsNotifyWatcher {
         socket_path: PathBuf,
         mounts: impl IntoIterator<Item = (PathBuf, String)>,
     ) -> Option<Self> {
+        Self::start_with(socket_path, mounts, false)
+    }
+
+    /// [`Self::start_tagged`] for a process forked from a multithreaded parent
+    /// without exec. On macOS the native watcher (FSEvents) uses CoreFoundation,
+    /// which the Objective-C runtime aborts in such a child, so changes are
+    /// polled instead. Elsewhere this is the native watcher.
+    #[doc(hidden)]
+    pub fn start_tagged_after_fork(
+        socket_path: PathBuf,
+        mounts: impl IntoIterator<Item = (PathBuf, String)>,
+    ) -> Option<Self> {
+        Self::start_with(socket_path, mounts, cfg!(target_os = "macos"))
+    }
+
+    fn start_with(
+        socket_path: PathBuf,
+        mounts: impl IntoIterator<Item = (PathBuf, String)>,
+        poll: bool,
+    ) -> Option<Self> {
         // Opt-out escape hatch: setting SMOL_NO_HOT_RELOAD disables host FS
         // watching entirely (e.g. very large trees, or privacy preference).
         if std::env::var_os("SMOL_NO_HOT_RELOAD").is_some() {
@@ -120,7 +140,7 @@ impl FsNotifyWatcher {
         let stop_thread = stop.clone();
         let handle = std::thread::Builder::new()
             .name("fsnotify-watch".into())
-            .spawn(move || run_watch(socket_path, targets, stop_thread))
+            .spawn(move || run_watch(socket_path, targets, stop_thread, poll))
             .ok()?;
 
         Some(Self {
@@ -140,14 +160,27 @@ impl Drop for FsNotifyWatcher {
 }
 
 /// Watcher thread body: owns the OS watcher + a dedicated agent connection.
-fn run_watch(socket_path: PathBuf, targets: Vec<WatchTarget>, stop: Arc<AtomicBool>) {
+/// How often the polling watcher (forked children on macOS) rescans.
+const POLL_INTERVAL: Duration = Duration::from_secs(1);
+
+fn run_watch(socket_path: PathBuf, targets: Vec<WatchTarget>, stop: Arc<AtomicBool>, poll: bool) {
     let (tx, rx) = mpsc::channel::<notify::Result<Event>>();
 
-    let mut watcher = match notify::recommended_watcher(move |res| {
-        // The receiver is dropped only when this thread exits, so a send error
-        // just means we're shutting down.
+    // The receiver is dropped only when this thread exits, so a send error
+    // just means we're shutting down.
+    let handler = move |res| {
         let _ = tx.send(res);
-    }) {
+    };
+    let watcher: notify::Result<Box<dyn Watcher + Send>> = if poll {
+        notify::PollWatcher::new(
+            handler,
+            notify::Config::default().with_poll_interval(POLL_INTERVAL),
+        )
+        .map(|w| Box::new(w) as Box<dyn Watcher + Send>)
+    } else {
+        notify::recommended_watcher(handler).map(|w| Box::new(w) as Box<dyn Watcher + Send>)
+    };
+    let mut watcher = match watcher {
         Ok(w) => w,
         Err(e) => {
             warn!(error = %e, "failed to create host fs watcher; hot-reload propagation disabled");
