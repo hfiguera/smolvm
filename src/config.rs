@@ -587,6 +587,11 @@ pub struct VmRecord {
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub detached: bool,
 
+    /// Stop the machine once its workload exits, whatever the exit status.
+    /// The guest flushes storage as for `machine stop`, then powers off.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub stop_on_exit: bool,
+
     /// Planned number of runnable CUDA fork clones. Persisted so every clone
     /// receives the same pre-initialization VRAM policy as its golden.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -818,6 +823,7 @@ impl VmRecord {
             cuda: false,
             forkable: false,
             detached: false,
+            stop_on_exit: false,
             cuda_fork_pool_size: None,
             cuda_vram_limit_mib: None,
             cuda_preload_modules: false,
@@ -901,6 +907,7 @@ impl VmRecord {
             cuda: false,
             forkable: false,
             detached: false,
+            stop_on_exit: false,
             cuda_fork_pool_size: None,
             cuda_vram_limit_mib: None,
             cuda_preload_modules: false,

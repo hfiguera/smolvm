@@ -2988,6 +2988,16 @@ mod tests {
     }
 
     #[test]
+    fn create_accepts_stop_on_exit_flag() {
+        let cli =
+            TestMachineCli::parse_from(["machine", "create", "--name", "worker", "--stop-on-exit"]);
+        let MachineCmd::Create(cmd) = cli.command else {
+            panic!("expected machine create command");
+        };
+        assert!(cmd.stop_on_exit);
+    }
+
+    #[test]
     fn create_accepts_auto_graph_flag() {
         let cli =
             TestMachineCli::parse_from(["machine", "create", "--name", "golden", "--auto-graph"]);
@@ -3837,6 +3847,11 @@ pub struct CreateCmd {
     #[arg(long)]
     pub ssh_agent: bool,
 
+    /// Stop the machine once its workload exits, whatever the exit status.
+    /// The guest flushes storage as for `machine stop`, then powers off.
+    #[arg(long)]
+    pub stop_on_exit: bool,
+
     /// Remote guest CUDA Driver-API calls to the host NVIDIA GPU over vsock
     #[arg(long)]
     pub cuda: bool,
@@ -4083,6 +4098,9 @@ impl CreateCmd {
         )?;
         if self.ssh_agent {
             params.ssh_agent = true;
+        }
+        if self.stop_on_exit {
+            params.stop_on_exit = true;
         }
         if self.cuda {
             params.cuda = true;
@@ -4429,6 +4447,7 @@ impl CreateCmd {
             // A restored durable checkpoint remains eligible to become a new
             // fork/checkpoint source without a topology-changing restart.
             forkable: checkpoint.is_some(),
+            stop_on_exit: self.stop_on_exit,
             cuda_fork_pool_size: None,
             cuda_vram_limit_mib: None,
             docker_socket: self.docker_socket,

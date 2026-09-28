@@ -83,6 +83,7 @@ smolvm machine create --name myvm --image ./myapp.tar     # persistent, from a l
 - **`machine run`** — ephemeral. All changes are discarded when the command exits.
 - **`machine exec`** — persistent. Filesystem changes (package installs, config edits) persist across exec sessions for the same machine, whether bare or image-based. Changes are stored in an overlay on the machine's storage disk.
 - **`machine stop` + `start`** — changes persist across restarts. The persistent overlay is remounted preserving previous changes.
+- **`machine create --stop-on-exit`** (or Smolfile `stop_on_exit = true`) — the machine stops by itself when its workload (image entrypoint/cmd, or the command after `--`) exits, whatever the exit status. Storage is flushed exactly as for `machine stop`, so nothing the workload wrote is lost. `machine exec` sessions never trigger it. The machine's restart policy then applies as for any stop (the default, `never`, leaves it stopped); the workload's own exit status is not passed on.
 - **`pack run`** — ephemeral. Each run starts fresh from the packed image.
 - **`pack start` + `exec`** — daemon mode. `/workspace` persists across exec sessions and stop/start. Container overlay resets per exec (package installs don't persist — use `/workspace` for durable data).
 - **`machine create --from .smolmachine`** — creates a persistent named machine from a packed artifact. Boots from pre-extracted layers (~250ms, no image pull). Full `machine exec` persistence — package installs, file writes all survive across exec and stop/start.
@@ -178,6 +179,7 @@ rejected with a hint to build first (`docker build … && docker save … | … 
 | `--allow-host` | | run, create | Hostname egress filter, resolved at VM start (implies --net) |
 | `--allow-host-pattern` | | run, create | Opt-in exact hostname or `*.domain` subdomains (implies --net) |
 | `--ssh-agent` | | run, create | Forward host SSH agent (git/ssh without exposing keys) |
+| `--stop-on-exit` | | create | Stop the machine when its workload exits, whatever the exit status |
 
 ## Smolfile Reference
 
@@ -190,6 +192,7 @@ entrypoint = ["/app/run"]             # overrides image ENTRYPOINT
 cmd = ["serve"]                       # overrides image CMD
 env = ["PORT=8080", "DEBUG=1"]        # environment variables
 workdir = "/app"                      # working directory
+stop_on_exit = true                   # stop the machine when the workload exits (default: false)
 
 # Resources
 cpus = 2                              # vCPUs (default: 4)

@@ -350,6 +350,9 @@ pub struct Smolfile {
     pub health: Option<HealthConfig>,
     /// Restart policy.
     pub restart: Option<RestartConfig>,
+    /// Stop the machine once its workload exits, whatever the exit status.
+    #[serde(default)]
+    pub stop_on_exit: bool,
     /// Credential forwarding.
     pub auth: Option<AuthConfig>,
     /// Service metadata for deployment.

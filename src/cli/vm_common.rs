@@ -497,6 +497,8 @@ pub struct CreateVmParams {
     pub cuda: bool,
     /// Start this machine as a copy-on-write fork base by default.
     pub forkable: bool,
+    /// Stop the machine once its workload exits.
+    pub stop_on_exit: bool,
     /// Planned number of runnable CUDA fork clones.
     pub cuda_fork_pool_size: Option<u32>,
     /// Explicit logical VRAM limit for each golden/clone CUDA session.
@@ -805,6 +807,7 @@ pub(crate) fn build_vm_record_for(
     record.ssh_agent = params.ssh_agent;
     record.cuda = params.cuda;
     record.forkable = params.forkable || params.cuda_fork_pool_size.is_some();
+    record.stop_on_exit = params.stop_on_exit;
     record.cuda_fork_pool_size = params.cuda_fork_pool_size;
     record.cuda_vram_limit_mib = params.cuda_vram_limit_mib;
     record.docker_socket = params.docker_socket;
@@ -1954,6 +1957,9 @@ fn start_vm_named_with_db(
         );
     }
 
+    // A bare machine's command runs to completion during start; with
+    // `stop_on_exit` the machine is stopped once it has.
+    let mut stop_after_workload = false;
     if let Some(ref img) = record.image {
         // Image-based machine: launch the workload container in the background.
         // An empty command → the agent resolves the image's own ENTRYPOINT+CMD,
@@ -2016,6 +2022,7 @@ fn start_vm_named_with_db(
             if exit_code != 0 {
                 eprintln!("workload exited with code {}", exit_code);
             }
+            stop_after_workload = record.stop_on_exit;
         }
         println!("Machine '{}' running (PID: {})", name, pid.unwrap_or(0));
     }
@@ -2035,6 +2042,13 @@ fn start_vm_named_with_db(
 
     // Keep VM running (persistent)
     manager.detach();
+    if stop_after_workload {
+        println!(
+            "Workload exited; stopping machine '{}' (stop_on_exit)",
+            name
+        );
+        return stop_vm_named(name);
+    }
     Ok(())
 }
 

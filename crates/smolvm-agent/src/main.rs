@@ -2593,6 +2593,7 @@ fn handle_request(
             stdin_data,
             background,
             s3_volumes,
+            stop_vm_on_exit: _,
         } => {
             if background {
                 handle_run_background(
@@ -3970,6 +3971,7 @@ fn handle_run_detached(
         persistent_overlay_id,
         unprivileged,
         s3_volumes,
+        stop_vm_on_exit,
     ) = match request {
         AgentRequest::Run {
             image,
@@ -3981,6 +3983,7 @@ fn handle_run_detached(
             persistent_overlay_id,
             unprivileged,
             s3_volumes,
+            stop_vm_on_exit,
             ..
         } => (
             image,
@@ -3992,6 +3995,7 @@ fn handle_run_detached(
             persistent_overlay_id,
             unprivileged,
             s3_volumes,
+            stop_vm_on_exit,
         ),
         _ => {
             send_response(
@@ -4214,6 +4218,9 @@ fn handle_run_detached(
                 container_id = %container_id,
                 "detached container started via create+start"
             );
+            if stop_vm_on_exit {
+                stop_machine_when_workload_exits(container_id.clone());
+            }
             send_response(
                 stream,
                 &AgentResponse::Completed {
@@ -4245,6 +4252,37 @@ fn handle_run_detached(
     }
 
     Ok(())
+}
+
+/// Power the machine off once the workload container `container_id` exits,
+/// whatever its exit status (`stop_on_exit`). Storage is flushed exactly as for
+/// a `machine stop` before the power-off, so nothing the workload wrote is lost.
+///
+/// The workload's process is re-parented to the agent, which does not reap
+/// unknown children, so it may linger as a zombie; `is_container_running`
+/// already treats a zombie as exited.
+#[cfg(target_os = "linux")]
+fn stop_machine_when_workload_exits(container_id: String) {
+    let spawned = std::thread::Builder::new()
+        .name("stop-on-exit".into())
+        .spawn(move || {
+            while is_container_running(&container_id) {
+                std::thread::sleep(std::time::Duration::from_millis(500));
+            }
+            info!(container_id = %container_id, "workload exited; stopping the machine (stop_on_exit)");
+            if let Err(e) = shutdown_freeze::freeze_internal_filesystems() {
+                warn!(error = %e, "stop_on_exit: flushing storage before power-off failed");
+            }
+            // SAFETY: sync(2) and reboot(2) take no pointers; the agent is PID 1,
+            // so RB_POWER_OFF ends the VM once the flush above has completed.
+            unsafe {
+                libc::sync();
+                libc::reboot(libc::RB_POWER_OFF);
+            }
+        });
+    if let Err(e) = spawned {
+        warn!(error = %e, "stop_on_exit: could not start the workload watcher");
+    }
 }
 
 /// Non-Linux stub: the agent only runs on Linux; this exists so the host-side

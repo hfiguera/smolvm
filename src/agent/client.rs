@@ -667,6 +667,9 @@ pub struct RunConfig {
     /// its (image-resolved) command. Set by the workload launcher; the agent
     /// wraps the resolved command so the image's real entrypoint still runs.
     pub s3_volumes: Vec<smolvm_protocol::S3Volume>,
+    /// Power the machine off once this detached workload exits. Only the
+    /// workload launcher sets it; exec sessions never do.
+    pub stop_vm_on_exit: bool,
 }
 
 impl RunConfig {
@@ -689,6 +692,7 @@ impl RunConfig {
             stdin: None,
             unprivileged: false,
             s3_volumes: Vec::new(),
+            stop_vm_on_exit: false,
         }
     }
 
@@ -796,6 +800,12 @@ impl RunConfig {
     /// Run as an unprivileged container (defense-in-depth for untrusted code).
     pub fn with_unprivileged(mut self, unprivileged: bool) -> Self {
         self.unprivileged = unprivileged;
+        self
+    }
+
+    /// Power the machine off once this detached workload exits.
+    pub fn with_stop_vm_on_exit(mut self, stop: bool) -> Self {
+        self.stop_vm_on_exit = stop;
         self
     }
 }
@@ -2300,6 +2310,7 @@ impl AgentClient {
             stdin_data: config.stdin,
             background: false,
             s3_volumes: config.s3_volumes.clone(),
+            stop_vm_on_exit: false,
         })?;
 
         expect_completed(resp, "run command")
@@ -2327,6 +2338,7 @@ impl AgentClient {
             stdin_data: None,
             background: true,
             s3_volumes: config.s3_volumes.clone(),
+            stop_vm_on_exit: false,
         })?;
 
         let (exit_code, stdout, _stderr) = expect_completed(resp, "run background")?;
@@ -2371,6 +2383,7 @@ impl AgentClient {
             stdin_data: None,
             background: false,
             s3_volumes: config.s3_volumes.clone(),
+            stop_vm_on_exit: false,
         })?;
 
         collect_exec_events(self, "run streaming", on_event)
@@ -2409,6 +2422,7 @@ impl AgentClient {
                 stdin_data: None,
                 background: false,
                 s3_volumes: config.s3_volumes.clone(),
+                stop_vm_on_exit: false,
             },
             tty,
             "run interactive",
@@ -2447,6 +2461,7 @@ impl AgentClient {
             stdin_data: None,
             background: false,
             s3_volumes: config.s3_volumes,
+            stop_vm_on_exit: config.stop_vm_on_exit,
         })?;
         let resp = loop {
             match self.receive()? {
@@ -2683,6 +2698,7 @@ impl AgentClient {
                 stdin_data: None,
                 background: false,
                 s3_volumes: config.s3_volumes.clone(),
+                stop_vm_on_exit: false,
             },
             input,
             on_output,

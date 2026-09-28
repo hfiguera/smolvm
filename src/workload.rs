@@ -99,7 +99,8 @@ pub fn launch_image_workload(
                 .with_user(record.user.clone())
                 .with_mounts(record_mounts_to_bindings(record))
                 .in_machine(record, machine_name, &exec_env)
-                .with_env(exec_env.clone()),
+                .with_env(exec_env.clone())
+                .with_stop_vm_on_exit(record.stop_on_exit),
         )
     };
     match launch(client) {

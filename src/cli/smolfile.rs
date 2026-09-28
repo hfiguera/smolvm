@@ -161,6 +161,7 @@ pub fn build_create_params(
                 ssh_agent: false,
                 cuda: false,
                 forkable: false,
+                stop_on_exit: false,
                 cuda_fork_pool_size: None,
                 cuda_vram_limit_mib: None,
                 docker_socket: false,
@@ -410,6 +411,7 @@ pub fn build_create_params(
         ssh_agent: sf.auth.as_ref().and_then(|a| a.ssh_agent).unwrap_or(false),
         cuda,
         forkable,
+        stop_on_exit: sf.stop_on_exit,
         cuda_fork_pool_size: fork.pool_size,
         cuda_vram_limit_mib: fork.cuda_vram_limit_mib,
         docker_socket: sf.docker_socket.unwrap_or(false),
@@ -923,6 +925,29 @@ init = ["echo init"]
 
         let params = build_from_smolfile(path).unwrap();
         assert_eq!(params.block_io, BlockIoEngine::Async);
+    }
+
+    #[test]
+    fn stop_on_exit_smolfile_reaches_the_machine_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("Smolfile");
+        std::fs::write(
+            &path,
+            "image = \"alpine\"\nnet = true\nstop_on_exit = true\n",
+        )
+        .unwrap();
+        let params = build_from_smolfile(path).unwrap();
+        assert!(params.stop_on_exit);
+        let record = crate::cli::vm_common::build_vm_record(&params).unwrap();
+        assert!(record.stop_on_exit);
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("Smolfile");
+        std::fs::write(&path, "image = \"alpine\"\nnet = true\n").unwrap();
+        assert!(
+            !build_from_smolfile(path).unwrap().stop_on_exit,
+            "off unless asked for"
+        );
     }
 
     #[test]

@@ -33,5 +33,25 @@ instead of silently doing nothing.
 
 Common keys: `image`, `cpus`, `memory`, `net`, `ports`, `volumes`, `env`,
 `init` (runs once as root, like a Dockerfile `RUN`), `workdir`, `user` (who the
-workload runs as), `gpu`, `cuda`, `docker_socket`, `storage`, `overlay`, and the
+workload runs as), `gpu`, `cuda`, `docker_socket`, `storage`, `overlay`,
+`stop_on_exit` (stop the machine when its workload exits), and the
 `[network]`, `[dev]`, `[auth]`, `[health]`, `[restart]`, `[service]` tables.
+
+### Stopping when the workload exits
+
+By default a machine keeps running after its workload exits. With
+`stop_on_exit = true` (or `machine create --stop-on-exit`) it stops by itself
+instead, whatever the exit status, so a workload can shut its machine down, for
+example after an idle timeout:
+
+```toml
+image = "python:3.12-alpine"
+net = true
+cmd = ["python3", "/app/server.py"]   # exits after 30 idle minutes
+stop_on_exit = true
+```
+
+Storage is flushed exactly as for `machine stop`, so files the workload wrote
+survive. `machine exec` sessions never trigger it; only the workload itself
+does. The machine's restart policy then applies as for any stop: the default
+`never` leaves it stopped. The workload's exit status is not passed on.

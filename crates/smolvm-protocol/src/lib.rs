@@ -270,6 +270,48 @@ fn shutdown_progress_disabled(progress: &bool) -> bool {
 mod shutdown_compat_tests {
     use super::*;
 
+    /// `stop_vm_on_exit` is additive: an older host never sends it (off), and
+    /// when off it is omitted from the wire so an older agent sees the exact
+    /// request it always did.
+    #[test]
+    fn run_stop_vm_on_exit_is_off_by_default_and_omitted_when_off() {
+        let run = |stop_vm_on_exit| AgentRequest::Run {
+            image: "alpine".into(),
+            command: vec!["true".into()],
+            env: vec![],
+            workdir: None,
+            user: None,
+            mounts: vec![],
+            timeout_ms: None,
+            interactive: false,
+            tty: false,
+            detached: true,
+            unprivileged: false,
+            persistent_overlay_id: Some("m".into()),
+            stdin_data: None,
+            background: false,
+            s3_volumes: vec![],
+            stop_vm_on_exit,
+        };
+        let off = serde_json::to_string(&run(false)).unwrap();
+        assert!(!off.contains("stop_vm_on_exit"), "{off}");
+        assert!(matches!(
+            serde_json::from_str::<AgentRequest>(&off).unwrap(),
+            AgentRequest::Run {
+                stop_vm_on_exit: false,
+                ..
+            }
+        ));
+        let on = serde_json::to_string(&run(true)).unwrap();
+        assert!(matches!(
+            serde_json::from_str::<AgentRequest>(&on).unwrap(),
+            AgentRequest::Run {
+                stop_vm_on_exit: true,
+                ..
+            }
+        ));
+    }
+
     #[test]
     fn legacy_shutdown_wire_shape_is_unchanged() {
         let wire = r#"{"method":"shutdown"}"#;
@@ -643,6 +685,11 @@ pub enum AgentRequest {
         /// instruction already sees them and its command is never rewritten.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         s3_volumes: Vec<S3Volume>,
+        /// Power the machine off once this detached workload exits, whatever its
+        /// exit status: the guest flushes storage exactly as for `machine stop`,
+        /// then powers off. Only honored for detached runs. Older agents ignore it.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        stop_vm_on_exit: bool,
     },
 
     /// Send stdin data to a running interactive command.
