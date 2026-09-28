@@ -171,6 +171,10 @@ pub(crate) fn resume_vm(db: &SmolvmDb, name: &str, detached: bool) -> Result<Sta
         &record,
         LaunchFeatures {
             resume_paused: true,
+            // On Linux x86_64, restore with branchable RAM so libkrun can map the
+            // retained checkpoint image directly instead of copying it.
+            #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+            forkable: true,
             watch_parent: detached.then_some(false),
             // A same-machine restore keeps its existing owner, rather than
             // inferring a new UID from the temporary snapshot's directory depth.
