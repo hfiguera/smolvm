@@ -14,8 +14,7 @@
 smolvm
 ======
 
-**Branchable microVMs for AI agents.**
-Embed them in your app, ship them as a file, and run them free on your own machine.
+**Embed lightweight virtual machines into your software, portable dev environments, and local sandboxing.**
 
 Install
 -------
@@ -89,8 +88,8 @@ smolvm pack create --image python:3.12-alpine -o ./python312
 
 Checkpoints are portable too: restore one on another host or on smol cloud.
 
-Safe
-----
+Safe (Shared responsibility model)
+----------------------------------
 
 Each workload gets a hardware-isolated VM with its own kernel. Networking is off by default, egress can be limited to named hosts, and code can use a credential without ever reading it.
 
