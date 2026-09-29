@@ -1508,7 +1508,10 @@ fn capture_with_completion(
             .prepared_cache_budget_bytes
             .is_some_and(|bytes| bytes > 0)
         && smolvm_pack::extract::shared_extract_enabled();
-    let sparse_capable = cfg!(all(target_os = "linux", target_arch = "x86_64"))
+    let sparse_capable = cfg!(any(
+        all(target_os = "linux", target_arch = "x86_64"),
+        all(target_os = "macos", target_arch = "aarch64")
+    ))
         && crate::agent::fork::control_socket_cmd(&control, "SAVE_SPARSE_CAPABILITIES")?.trim()
             == "OK sparse-stream-v1 ownership-v1";
     let max_memory_image = max_checkpoint_memory_image(vm.mem, vm.source_smolmachine.is_some())?;
