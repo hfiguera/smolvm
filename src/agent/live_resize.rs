@@ -644,6 +644,76 @@ fn shrink_cpus_locked(db: &SmolvmDb, name: &str, target: u8) -> Result<VmRecord>
 }
 
 /// Grow running disks and their mounted filesystems without restarting the VM.
+/// Check every requested target of a running machine before any of them is
+/// applied, so a request that can be refused up front changes nothing.
+///
+/// These are the static rules the individual grow calls enforce; host memory
+/// headroom and guest capabilities are still checked by each call, before it
+/// changes anything.
+pub fn check_targets(
+    db: &SmolvmDb,
+    name: &str,
+    cpus: Option<u8>,
+    mem_mib: Option<u32>,
+    storage_gb: Option<u64>,
+    overlay_gb: Option<u64>,
+) -> Result<()> {
+    let record = db.get_vm(name)?.ok_or_else(|| Error::vm_not_found(name))?;
+    if record.actual_state() != RecordState::Running {
+        return Err(Error::agent_conflict(
+            "live resize",
+            "machine must be running",
+        ));
+    }
+    if let Some(target) = mem_mib {
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        {
+            let _ = target;
+            return Err(unsupported_live_memory());
+        }
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        {
+            ensure_live_memory_platform()?;
+            if target < record.mem {
+                return Err(Error::config("RAM resize", "RAM cannot shrink"));
+            }
+        }
+    }
+    if let Some(target) = cpus {
+        if target == 0 {
+            return Err(Error::config("CPU resize", "CPU count cannot be zero"));
+        }
+        ensure_live_compute_platform("CPU resize")?;
+        if target < record.cpus && !cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+            return Err(Error::config(
+                "CPU shrink",
+                "live CPU shrink requires Linux x86_64 with offline-CPU checkpoint support; no CPUs changed",
+            ));
+        }
+    }
+    if storage_gb.is_some() || overlay_gb.is_some() {
+        if let Some(target) = storage_gb {
+            validate_growth(
+                record.storage_gb.unwrap_or(DEFAULT_STORAGE_SIZE_GIB),
+                target,
+            )?;
+        }
+        if let Some(target) = overlay_gb {
+            validate_growth(
+                record.overlay_gb.unwrap_or(DEFAULT_OVERLAY_SIZE_GIB),
+                target,
+            )?;
+        }
+        if !db.dependent_clones(name)?.is_empty() {
+            return Err(Error::agent_conflict(
+                "live resize",
+                "cannot modify a disk with dependent branches",
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// After the runtime confirms growth, record the new disk limit even if the
 /// subsequent filesystem operation fails. Retrying the same limit then finishes
 /// the filesystem operation instead of attempting to undo disk growth.

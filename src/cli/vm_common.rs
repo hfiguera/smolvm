@@ -3375,6 +3375,8 @@ pub fn expand_disks(
 }
 
 /// Resize running resources through the shared engine and its durable journal.
+/// Several resources in one call are checked together first, then applied
+/// in order (RAM, CPUs, disks), each as its own journaled request.
 /// Stopped disk expansion retains the previous behavior; CPU/RAM settings for
 /// a stopped machine remain the responsibility of `machine update`.
 pub fn resize_vm(
@@ -3395,22 +3397,46 @@ pub fn resize_vm(
 
     let actual_state = record.actual_state();
     if actual_state == RecordState::Running {
-        let kinds = u8::from(new_cpus.is_some())
-            + u8::from(new_mem.is_some())
-            + u8::from(new_storage_gb.is_some() || new_overlay_gb.is_some());
-        if kinds != 1 {
-            return Err(smolvm::Error::config(
-                "live resize",
-                "resize CPUs, RAM, and disks in separate requests",
-            ));
+        smolvm::agent::live_resize::check_targets(
+            &db,
+            name,
+            new_cpus,
+            new_mem,
+            new_storage_gb,
+            new_overlay_gb,
+        )?;
+        // RAM first: its host headroom check is the likeliest refusal, and it
+        // refuses before anything changes. Then CPUs, then disks.
+        let mut resized = record;
+        let mut applied = Vec::new();
+        let result = (|| {
+            if let Some(mem) = new_mem {
+                resized = smolvm::agent::live_resize::grow_memory(&db, name, mem)?;
+                applied.push(format!("{} MiB RAM", resized.mem));
+            }
+            if let Some(cpus) = new_cpus {
+                resized = smolvm::agent::live_resize::grow_cpus(&db, name, cpus)?;
+                applied.push(format!("{} CPUs", resized.cpus));
+            }
+            if new_storage_gb.is_some() || new_overlay_gb.is_some() {
+                resized = smolvm::agent::live_resize::grow_disks(
+                    &db,
+                    name,
+                    new_storage_gb,
+                    new_overlay_gb,
+                )?;
+            }
+            Ok::<_, smolvm::Error>(())
+        })();
+        if let Err(error) = result {
+            if !applied.is_empty() {
+                eprintln!(
+                    "Resized running machine '{name}' to {} before this failure",
+                    applied.join(", ")
+                );
+            }
+            return Err(error);
         }
-        let resized = if let Some(cpus) = new_cpus {
-            smolvm::agent::live_resize::grow_cpus(&db, name, cpus)?
-        } else if let Some(mem) = new_mem {
-            smolvm::agent::live_resize::grow_memory(&db, name, mem)?
-        } else {
-            smolvm::agent::live_resize::grow_disks(&db, name, new_storage_gb, new_overlay_gb)?
-        };
         println!(
             "Resized running machine '{name}' without rebooting: {} CPUs, {} MiB RAM",
             resized.cpus, resized.mem

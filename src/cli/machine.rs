@@ -5342,8 +5342,10 @@ impl LsCmd {
 /// Resize a machine's resources without rebooting a running workload.
 ///
 /// Running machines online added resources immediately when the runtime and
-/// guest support hot-add. Stopped machines retain disk expansion support;
-/// use `update` for stopped CPU/RAM settings. Sizes are absolute targets.
+/// guest support hot-add. Several resources in one command are checked
+/// together before any changes, then applied RAM first, CPUs, then disks.
+/// Stopped machines retain disk expansion support; use `update` for stopped
+/// CPU/RAM settings. Sizes are absolute targets.
 /// CPU shrinking requires Linux x86_64 and a compatible runtime and agent.
 /// RAM and disk shrinking are rejected without reducing capacity.
 ///
@@ -5354,6 +5356,7 @@ impl LsCmd {
 ///   smolvm machine resize --storage 50  # default VM
 ///   smolvm machine resize --name my-vm --cpus 4
 ///   smolvm machine resize --name my-vm --mem 4096
+///   smolvm machine resize --name my-vm --cpus 4 --mem 4096
 #[derive(Args, Debug)]
 #[command(group(
     clap::ArgGroup::new("resize-target")
