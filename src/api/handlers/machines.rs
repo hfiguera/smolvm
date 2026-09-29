@@ -2822,6 +2822,26 @@ fn validate_workload_image_source(
     Ok(())
 }
 
+/// Parse an optional JSON request body. No body, a whitespace-only body, or a
+/// non-JSON content type all mean "no request"; many HTTP clients send
+/// `Content-Type: application/json` on every call, including empty POSTs.
+fn optional_json_body<T: serde::de::DeserializeOwned + Default>(
+    headers: &axum::http::HeaderMap,
+    body: &[u8],
+) -> Result<T, ApiError> {
+    let is_json = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(';').next())
+        .map(|essence| essence.trim().to_ascii_lowercase())
+        .is_some_and(|essence| essence == "application/json" || essence.ends_with("+json"));
+    if !is_json || body.iter().all(u8::is_ascii_whitespace) {
+        return Ok(T::default());
+    }
+    serde_json::from_slice(body)
+        .map_err(|error| ApiError::BadRequest(format!("invalid JSON request body: {error}")))
+}
+
 /// Start a machine.
 #[utoipa::path(
     post,
@@ -2848,9 +2868,10 @@ pub async fn start_machine(
     Query(query): Query<StartMachineQuery>,
     // Optional: the route took only a query string before this existed, so a
     // caller that sends no body (or a non-JSON one) still starts normally.
-    body: Option<Json<crate::api::types::StartMachineRequest>>,
+    headers: axum::http::HeaderMap,
+    body: Bytes,
 ) -> Result<Json<MachineInfo>, ApiError> {
-    let request = body.map(|Json(request)| request).unwrap_or_default();
+    let request: crate::api::types::StartMachineRequest = optional_json_body(&headers, &body)?;
     let registry_auth: Option<crate::registry::RegistryAuth> =
         request.registry_auth.map(Into::into);
     let external_interceptor = request
@@ -5549,6 +5570,32 @@ mod tests {
     use crate::db::SmolvmDb;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tempfile::TempDir;
+
+    #[test]
+    fn start_body_is_optional_even_with_a_json_content_type() {
+        use crate::api::types::StartMachineRequest;
+        let json = {
+            let mut headers = axum::http::HeaderMap::new();
+            headers.insert(header::CONTENT_TYPE, "application/json".parse().unwrap());
+            headers
+        };
+        let none = axum::http::HeaderMap::new();
+        for (headers, body) in [
+            (&json, ""),
+            (&json, " \n"),
+            (&none, ""),
+            (&none, "not json"),
+        ] {
+            let request: StartMachineRequest =
+                optional_json_body(headers, body.as_bytes()).unwrap();
+            assert!(request.registry_auth.is_none() && request.egress_interceptor.is_none());
+        }
+        assert!(optional_json_body::<StartMachineRequest>(&json, b"{}").is_ok());
+        assert!(matches!(
+            optional_json_body::<StartMachineRequest>(&json, b"{not json"),
+            Err(ApiError::BadRequest(_))
+        ));
+    }
 
     #[test]
     fn machine_response_reports_resolved_image_for_registry_binding() {
