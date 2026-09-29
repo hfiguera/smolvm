@@ -172,9 +172,10 @@ jobs:
         run: |
           brew tap libkrun/krun
           brew trust libkrun/krun
-          brew install llvm libepoxy libkrun/krun/virglrenderer-krun
+          brew install llvm lld libepoxy libkrun/krun/virglrenderer-krun
           brew --prefix libkrun/krun/virglrenderer-krun
           echo "$(brew --prefix llvm)/bin" >> "$GITHUB_PATH"
+          echo "$(brew --prefix lld)/bin" >> "$GITHUB_PATH"
 
       - name: Build bundled libkrun (BLK=1 NET=1 GPU=1 INPUT=1)
         run: |
