@@ -88,10 +88,12 @@ smolvm pack create --image python:3.12-alpine -o ./python312
 
 Checkpoints are portable too: restore one on another host or on smol cloud.
 
-Safe (Shared responsibility model)
-----------------------------------
+Safe
+----
 
 Each workload gets a hardware-isolated VM with its own kernel. Networking is off by default, egress can be limited to named hosts, and code can use a credential without ever reading it.
+
+Safety is a shared responsibility. smolvm provides the boundary: a separate VM and kernel for every workload, with nothing reaching the host unless you allow it. You decide what crosses that boundary. Every folder you mount, port you open, host you allow, and secret or SSH agent you forward becomes something the workload can use, so give an untrusted workload only what it needs.
 
 ```bash
 smolvm machine run --net --image alpine --allow-host registry.npmjs.org -- wget -qO- https://google.com   # blocked
