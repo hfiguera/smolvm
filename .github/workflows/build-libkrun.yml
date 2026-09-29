@@ -180,7 +180,7 @@ jobs:
         run: |
           export LIBCLANG_PATH="$(brew --prefix llvm)/lib"
           export PKG_CONFIG_PATH="$(brew --prefix libkrun/krun/virglrenderer-krun)/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
-          make -C libkrun BLK=1 NET=1 GPU=1 INPUT=1
+          make -C libkrun CLANG="$(brew --prefix llvm)/bin/clang" BLK=1 NET=1 GPU=1 INPUT=1
           cp libkrun/target/release/libkrun.2.0.0.dylib lib/libkrun.dylib
           epoxy="$(brew --prefix libepoxy)/lib/libepoxy.0.dylib"
           virgl="$(brew --prefix libkrun/krun/virglrenderer-krun)/lib/libvirglrenderer.1.dylib"
