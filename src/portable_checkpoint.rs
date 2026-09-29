@@ -3945,6 +3945,29 @@ fn protect_restore_directory(path: &Path) -> Result<()> {
 /// instead of copying it. On by default; `SMOLVM_RESTORE_COW_DISK=0` restores
 /// the full copy.
 #[cfg(target_os = "linux")]
+/// Deepest captured chain a restore still layers over instead of copying its
+/// top. Each such restore adds one layer, so this bounds the chain's depth.
+#[cfg(target_os = "linux")]
+const MAX_COW_CHAIN_FILES: usize = 4;
+
+/// Check that the qcow2 `staged` (file `index` of `disk`) is backed by exactly
+/// the next file of the captured chain.
+fn verify_qcow2_backing(staged: &Path, disk: &CheckpointDisk, index: usize) -> Result<()> {
+    let (backing, _) = inspect_qcow2(staged)?;
+    let expected = disk.files.get(index + 1).map(|next| next.target.as_str());
+    if backing.as_deref() != expected {
+        return Err(Error::agent(
+            "install checkpoint",
+            format!(
+                "qcow2 '{}' references {:?}, expected {:?}",
+                disk.files[index].target, backing, expected
+            ),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
 fn cow_restore_enabled() -> bool {
     std::env::var("SMOLVM_RESTORE_COW_DISK").map_or(true, |value| value != "0")
 }
@@ -4077,6 +4100,48 @@ fn install_with(
                         }
                         continue;
                     }
+                    // A captured chain's top is copied in full so it stays
+                    // private, which is most of the restore. Like the single-file
+                    // case above, share it as one more immutable layer instead and
+                    // give this machine a thin top of its own. Bounded, so repeated
+                    // rewinds can't deepen the chain without limit.
+                    #[cfg(target_os = "linux")]
+                    if index == 0
+                        && file.format == "qcow2"
+                        && (2..=MAX_COW_CHAIN_FILES).contains(&disk.files.len())
+                        && cow_restore_enabled()
+                    {
+                        let layer_name = format!(
+                            ".smolcheckpoint-{}-layer{}.qcow2",
+                            disk.role,
+                            disk.files.len()
+                        );
+                        if !disk.files.iter().any(|f| f.target == layer_name) {
+                            let staged_layer = staged_disks.join(&layer_name);
+                            promote_retained_backing(extracted, &source, &file.asset)?;
+                            link_or_copy_verified_sparse(&source, &staged_layer, &file.asset)?;
+                            if same_inode(&source, &staged_layer)? {
+                                verify_qcow2_backing(&staged_layer, disk, index)?;
+                                cow_tops.push((
+                                    vm_data_dir.join(&file.target),
+                                    vm_data_dir.join(&layer_name),
+                                    crate::data::disk::DiskFormat::Qcow2,
+                                ));
+                                staged_names.push(layer_name);
+                                tracing::info!(asset = %file.asset.path, elapsed_ms = started.elapsed().as_millis(), method = "cow_top", "checkpoint disk installed");
+                                continue;
+                            }
+                            // Not shared with the cache, so it's a private copy
+                            // already: use it as the writable top.
+                            std::fs::rename(&staged_layer, &staged).map_err(|error| {
+                                Error::agent("stage checkpoint disk", error.to_string())
+                            })?;
+                            verify_qcow2_backing(&staged, disk, index)?;
+                            staged_names.push(file.target.clone());
+                            tracing::info!(asset = %file.asset.path, elapsed_ms = started.elapsed().as_millis(), writable = true, "checkpoint disk installed");
+                            continue;
+                        }
+                    }
                     staged_names.push(file.target.clone());
                     if index == 0 {
                         // The active top layer is writable after resume and must
@@ -4092,18 +4157,7 @@ fn install_with(
                         link_or_copy_verified_sparse(&source, &staged, &file.asset)?;
                     }
                     if file.format == "qcow2" {
-                        let (backing, _) = inspect_qcow2(&staged)?;
-                        let expected_backing =
-                            disk.files.get(index + 1).map(|next| next.target.as_str());
-                        if backing.as_deref() != expected_backing {
-                            return Err(Error::agent(
-                                "install checkpoint",
-                                format!(
-                                    "qcow2 '{}' references {:?}, expected {:?}",
-                                    file.target, backing, expected_backing
-                                ),
-                            ));
-                        }
+                        verify_qcow2_backing(&staged, disk, index)?;
                     }
                     tracing::info!(asset = %file.asset.path, elapsed_ms = started.elapsed().as_millis(), writable = index == 0, "checkpoint disk installed");
                 }
