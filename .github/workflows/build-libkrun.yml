@@ -20,10 +20,15 @@ on:
         description: "Rebuild libkrunfw from source (full guest-kernel rebuild) instead of reusing the committed .so. Needed when a libkrunfw patch changed the guest kernel."
         type: boolean
         default: false
+      macos_only:
+        description: "Build only the bundled macOS libkrun dylib."
+        type: boolean
+        default: false
 
 jobs:
   build:
     name: libkrun ${{ matrix.arch }}
+    if: ${{ !inputs.macos_only }}
     strategy:
       fail-fast: false
       matrix:
@@ -82,6 +87,7 @@ jobs:
   # older runtime.
   windows-libkrun:
     name: libkrun windows-x86_64
+    if: ${{ !inputs.macos_only }}
     runs-on: ubuntu-22.04
     env:
       CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER: x86_64-w64-mingw32-gcc
@@ -120,7 +126,7 @@ jobs:
   # runs when refreshing libkrunfw, since the .dll wraps the guest kernel.
   windows-libkrunfw:
     name: libkrunfw.dll (windows cross)
-    if: ${{ inputs.rebuild_libkrunfw }}
+    if: ${{ inputs.rebuild_libkrunfw && !inputs.macos_only }}
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
@@ -146,4 +152,36 @@ jobs:
         with:
           name: libkrunfw-windows-x86_64
           path: libkrunfw/libkrunfw.dll
+          if-no-files-found: error
+
+  macos-libkrun:
+    name: libkrun macos-arm64
+    if: ${{ inputs.macos_only }}
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          lfs: true
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-unknown-linux-musl
+
+      - name: Install build dependencies
+        run: |
+          brew install llvm virglrenderer libepoxy
+          echo "$(brew --prefix llvm)/bin" >> "$GITHUB_PATH"
+
+      - name: Build bundled libkrun (BLK=1 NET=1 GPU=1 INPUT=1)
+        run: |
+          make -C libkrun smolvm
+          ./scripts/stamp-libkrun-provenance.sh lib --skip-libkrunfw
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: libkrun-macos-arm64
+          path: |
+            lib/libkrun.dylib
+            lib/libkrun.provenance
           if-no-files-found: error
