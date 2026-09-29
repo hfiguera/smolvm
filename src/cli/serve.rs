@@ -571,7 +571,12 @@ impl ServeStartCmd {
         let shutdown_handle = handle.clone();
         tokio::spawn(async move {
             shutdown_signal_or_internal(internal_shutdown).await;
-            shutdown_handle.graceful_shutdown(Some(std::time::Duration::from_secs(5)));
+            let grace = shutdown_grace();
+            tracing::info!(
+                grace_secs = grace.as_secs(),
+                "finishing in-flight requests before exit"
+            );
+            shutdown_handle.graceful_shutdown(Some(grace));
         });
 
         tracing::info!(address = %addr, "starting HTTPS API server (mTLS, client cert required)");
@@ -739,6 +744,32 @@ async fn shutdown_signal() {
     eprintln!("\nShutting down server (VMs continue running)...");
 }
 
+/// Default time a stopping HTTPS server gives in-flight requests to finish.
+const DEFAULT_SHUTDOWN_GRACE_SECS: u64 = 5;
+/// Upper bound on a configured grace, so a typo cannot make a stop hang for days.
+const MAX_SHUTDOWN_GRACE_SECS: u64 = 3600;
+
+/// How long a stopping HTTPS server lets in-flight requests finish before it
+/// drops them: `SMOLVM_SERVE_SHUTDOWN_GRACE_SECS`, default 5 s. A worker being
+/// upgraded sets it high so a long `exec` in progress completes instead of being
+/// cut off; the server stops accepting new connections as soon as it is asked to
+/// stop, so the grace only ever extends work that had already started.
+fn shutdown_grace() -> std::time::Duration {
+    parse_shutdown_grace(
+        std::env::var("SMOLVM_SERVE_SHUTDOWN_GRACE_SECS")
+            .ok()
+            .as_deref(),
+    )
+}
+
+fn parse_shutdown_grace(value: Option<&str>) -> std::time::Duration {
+    let secs = value
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(DEFAULT_SHUTDOWN_GRACE_SECS)
+        .min(MAX_SHUTDOWN_GRACE_SECS);
+    std::time::Duration::from_secs(secs)
+}
+
 async fn wait_for_shutdown(mut shutdown: tokio::sync::watch::Receiver<bool>) {
     while !*shutdown.borrow() {
         if shutdown.changed().await.is_err() {
@@ -757,6 +788,17 @@ async fn shutdown_signal_or_internal(shutdown: tokio::sync::watch::Receiver<bool
 #[cfg(test)]
 mod tests {
     use super::ListenTarget;
+
+    #[test]
+    fn shutdown_grace_defaults_and_is_bounded() {
+        use super::parse_shutdown_grace as grace;
+        assert_eq!(grace(None).as_secs(), 5);
+        assert_eq!(grace(Some("")).as_secs(), 5);
+        assert_eq!(grace(Some("not a number")).as_secs(), 5);
+        assert_eq!(grace(Some(" 300 ")).as_secs(), 300);
+        assert_eq!(grace(Some("0")).as_secs(), 0);
+        assert_eq!(grace(Some("999999")).as_secs(), 3600);
+    }
 
     #[test]
     fn parse_tcp_listen_target() {
