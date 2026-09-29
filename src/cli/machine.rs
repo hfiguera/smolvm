@@ -5457,6 +5457,36 @@ pub struct UpdateCmd {
     #[arg(long)]
     pub no_egress_interceptor: bool,
 
+    /// Allow egress to a hostname and its subdomains, as `machine create
+    /// --allow-host` does (can be used multiple times). An allow list is
+    /// enforced by the virtio-net backend only.
+    #[arg(
+        long = "allow-host",
+        value_name = "HOSTNAME",
+        conflicts_with = "no_net"
+    )]
+    pub allow_host: Vec<String>,
+
+    /// Allow egress to an exact hostname or `*.domain` subdomains only.
+    #[arg(
+        long = "allow-host-pattern",
+        value_name = "PATTERN",
+        conflicts_with = "no_net"
+    )]
+    pub allow_host_pattern: Vec<String>,
+
+    /// Allow egress to a CIDR range (can be used multiple times).
+    #[arg(long = "allow-cidr", value_parser = parse_cidr, value_name = "CIDR", conflicts_with = "no_net")]
+    pub allow_cidr: Vec<String>,
+
+    /// Remove an allowed hostname or pattern, written as it was added.
+    #[arg(long = "remove-allow-host", value_name = "HOSTNAME|PATTERN")]
+    pub remove_allow_host: Vec<String>,
+
+    /// Remove an allowed CIDR range.
+    #[arg(long = "remove-allow-cidr", value_parser = parse_cidr, value_name = "CIDR")]
+    pub remove_allow_cidr: Vec<String>,
+
     /// Add/replace environment variable (KEY=VALUE)
     #[arg(short = 'e', long = "env", value_name = "KEY=VALUE")]
     pub env: Vec<String>,
@@ -5499,6 +5529,83 @@ pub struct UpdateCmd {
 }
 
 impl UpdateCmd {
+    /// The record's egress after this update's allow-list flags, or `None`
+    /// when none were given. Hosts are stored as `machine create` stores them:
+    /// `--allow-host` bare (a name and its subdomains), `--allow-host-pattern`
+    /// strict-encoded. Removing the last entry would open egress to every
+    /// host, so that needs `--net` to say so.
+    fn next_egress(
+        &self,
+        record: &smolvm::config::VmRecord,
+    ) -> smolvm::Result<Option<smolvm::config::VmRecord>> {
+        use smolvm_protocol::host_pattern::encode_strict;
+        if self.allow_host.is_empty()
+            && self.allow_host_pattern.is_empty()
+            && self.allow_cidr.is_empty()
+            && self.remove_allow_host.is_empty()
+            && self.remove_allow_cidr.is_empty()
+        {
+            return Ok(None);
+        }
+        let mut hosts = record.dns_filter_hosts.clone().unwrap_or_default();
+        let mut cidrs = record.allowed_cidrs.clone().unwrap_or_default();
+        let was_restricted = !hosts.is_empty() || !cidrs.is_empty();
+
+        for host in &self.remove_allow_host {
+            let strict = encode_strict(host.trim()).ok();
+            let before = hosts.len();
+            hosts.retain(|stored| stored != host.trim() && Some(stored) != strict.as_ref());
+            if hosts.len() == before {
+                return Err(smolvm::Error::config(
+                    "update",
+                    format!("'{host}' is not in machine '{}''s allowed hosts", self.name),
+                ));
+            }
+        }
+        for cidr in &self.remove_allow_cidr {
+            let before = cidrs.len();
+            cidrs.retain(|stored| stored != cidr);
+            if cidrs.len() == before {
+                return Err(smolvm::Error::config(
+                    "update",
+                    format!("'{cidr}' is not in machine '{}''s allowed CIDRs", self.name),
+                ));
+            }
+        }
+        for host in &self.allow_host {
+            let host = host.trim();
+            // Validate the name the way a pattern would be, then keep the bare
+            // form for its apex-and-subdomains meaning.
+            encode_strict(host).map_err(|e| smolvm::Error::config("--allow-host", e))?;
+            if !hosts.iter().any(|stored| stored == host) {
+                hosts.push(host.to_string());
+            }
+        }
+        for pattern in &self.allow_host_pattern {
+            let encoded = encode_strict(pattern.trim())
+                .map_err(|e| smolvm::Error::config("--allow-host-pattern", e))?;
+            if !hosts.contains(&encoded) {
+                hosts.push(encoded);
+            }
+        }
+        for cidr in &self.allow_cidr {
+            if !cidrs.contains(cidr) {
+                cidrs.push(cidr.clone());
+            }
+        }
+
+        if was_restricted && hosts.is_empty() && cidrs.is_empty() && !self.net {
+            return Err(smolvm::Error::config(
+                "update",
+                "removing the last allowed host or CIDR would allow egress to every host; \
+                 pass --net as well to allow all, or --no-net to turn networking off",
+            ));
+        }
+        let mut next = record.clone();
+        next.replace_egress(true, cidrs, hosts)?;
+        Ok(Some(next))
+    }
+
     pub fn run(self) -> smolvm::Result<()> {
         use smolvm::config::RecordState;
         use smolvm::data::storage::HostMount;
@@ -5543,6 +5650,10 @@ impl UpdateCmd {
                 }
             }
         }
+
+        // The egress allow list after this update, validated as a whole before
+        // anything is written (#1299).
+        let egress = self.next_egress(&record)?;
 
         // Parse and validate new mounts (after state check so
         // "machine is running" takes priority over "directory not found")
@@ -5712,6 +5823,27 @@ impl UpdateCmd {
                     changes.push("  cleared network backend".to_string());
                     r.network_backend = None;
                 }
+            }
+            if let Some(ref next) = egress {
+                if r.allowed_cidrs != next.allowed_cidrs {
+                    changes.push(format!(
+                        "  allowed CIDRs: {}",
+                        next.allowed_cidrs
+                            .as_deref()
+                            .map_or("any".into(), |c| c.join(", "))
+                    ));
+                }
+                if r.dns_filter_hosts != next.dns_filter_hosts {
+                    changes.push(format!(
+                        "  allowed hosts: {}",
+                        next.dns_filter_hosts
+                            .as_deref()
+                            .map_or("any".into(), |h| h.join(", "))
+                    ));
+                }
+                r.network = next.network;
+                r.allowed_cidrs = next.allowed_cidrs.clone();
+                r.dns_filter_hosts = next.dns_filter_hosts.clone();
             }
             if self.no_egress_interceptor && r.external_interceptor_required {
                 r.external_interceptor_required = false;

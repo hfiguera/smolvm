@@ -1108,9 +1108,21 @@ impl VmRecord {
             .map(|host| smolvm_protocol::host_pattern::encode_strict(host.trim()))
             .collect::<std::result::Result<Vec<_>, _>>()
             .map_err(|reason| crate::Error::config("egress policy", reason))?;
+        self.replace_egress(policy.network, cidrs, hosts)
+    }
 
+    /// Replace this stopped machine's egress with normalized CIDRs and host
+    /// entries as `dns_filter_hosts` stores them (bare legacy names, or
+    /// strict-encoded patterns), under the same checks as
+    /// [`Self::apply_egress_policy`]. Leaves the record unchanged on error.
+    pub fn replace_egress(
+        &mut self,
+        network: bool,
+        cidrs: Vec<String>,
+        hosts: Vec<String>,
+    ) -> Result<()> {
         let mut next = self.clone();
-        next.network = policy.network;
+        next.network = network;
         next.allowed_cidrs = (!cidrs.is_empty()).then_some(cidrs);
         next.dns_filter_hosts = (!hosts.is_empty()).then_some(hosts);
         if let Some(credentials) = next.credential_policy.as_ref() {

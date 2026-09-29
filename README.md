@@ -104,6 +104,8 @@ NOTION_API_KEY=secret_… smolvm machine run --net --image alpine \
 See [credential substitution](docs/credential-substitution.md) and the [security model](docs/security-model.md).
 Use `--allow-host-pattern '*.example.com'` to allow subdomains only. The older
 `--allow-host example.com` continues to allow both the apex and subdomains.
+A stopped machine's allow list can be changed with `smolvm machine update`
+(`--allow-host`, `--allow-host-pattern`, `--allow-cidr` and their `--remove-` forms).
 
 How It Works
 ------------
