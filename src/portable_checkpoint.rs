@@ -1523,8 +1523,11 @@ fn capture_with_completion(
     // Deferred RAM capture rebases the live source's mappings. A packed
     // image's virtio-fs DAX window contains file mappings that must remain
     // intact for the source to keep executing after the checkpoint.
-    let use_deferred_save =
-        !cfg!(all(target_os = "linux", target_arch = "x86_64")) || vm.source_smolmachine.is_none();
+    // WHP only implements the eager, frozen save. Send SAVE directly rather
+    // than probing deferred commands that the Windows VMM cannot handle.
+    let use_deferred_save = !cfg!(target_os = "windows")
+        && (!cfg!(all(target_os = "linux", target_arch = "x86_64"))
+            || vm.source_smolmachine.is_none());
     // A capture that stops the VM keeps it paused until the RAM is written, so
     // libkrun can read RAM it cannot retain as a generation (a fork clone's)
     // in place instead of falling back to a synchronous save.
@@ -3647,7 +3650,13 @@ fn copy_verified(
         // Sharing those inodes would transfer ownership away from a sibling
         // during concurrent startup, denying it access under a private umask.
         crate::disk_utils::clone_or_copy_file(source, destination)?;
-        std::fs::File::open(destination)
+        // FlushFileBuffers on Windows requires a writable handle. These
+        // payloads are private writable copies, so reopen them for writing.
+        #[cfg(target_os = "windows")]
+        let copied = std::fs::OpenOptions::new().write(true).open(destination);
+        #[cfg(not(target_os = "windows"))]
+        let copied = std::fs::File::open(destination);
+        copied
             .and_then(|file| file.sync_all())
             .map_err(|error| Error::agent("sync checkpoint payload", error.to_string()))?;
         return Ok(());
@@ -3696,7 +3705,11 @@ fn copy_verified_sparse(source: &Path, destination: &Path, asset: &CheckpointAss
         ));
     }
     crate::disk_utils::clone_or_copy_file(source, destination)?;
-    std::fs::File::open(destination)
+    #[cfg(target_os = "windows")]
+    let copied = std::fs::OpenOptions::new().write(true).open(destination);
+    #[cfg(not(target_os = "windows"))]
+    let copied = std::fs::File::open(destination);
+    copied
         .and_then(|file| file.sync_all())
         .map_err(|error| Error::agent("sync checkpoint disk", error.to_string()))?;
     Ok(())

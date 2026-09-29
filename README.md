@@ -138,7 +138,7 @@ Platform Support
 | Linux aarch64 | aarch64 Linux | KVM (`/dev/kvm`) |
 | Windows x86_64 | x86_64 Linux | Windows Hypervisor Platform (WHP) enabled |
 
-Windows does not yet support branching, checkpoints or GPU acceleration. See [known limitations](docs/limitations.md).
+Windows supports portable checkpoints, pause/resume, and branches with `--freeze-source`. GPU acceleration remains unavailable; see [known limitations](docs/limitations.md).
 
 More
 ----

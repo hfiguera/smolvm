@@ -24,6 +24,8 @@ smolvm machine branch --from source --name child --freeze-source
 smolvm machine branch --from source --name child-2  # reuses the frozen checkpoint
 ```
 
+On Windows, `--freeze-source` is required for a live branch.
+
 To fan out many children from one checkpoint, the source's workload marks the
 point to take it by running `smolvm-branch-ready` once its setup is done, and
 names the program each child should run after it. The helper blocks in the

@@ -4,7 +4,7 @@
 //! A fork snapshots a running, forkable machine's RAM, device state, and disks,
 //! gives the clone private copy-on-write layers, and lets the caller boot the
 //! clone from that exact boundary. Linux and macOS resume the source
-//! immediately on new private layers; other hosts retain a frozen CoW base.
+//! immediately on new private layers; Windows retains a frozen CoW base.
 //! The boot itself differs between callers (the CLI uses `start_vm_named`; the
 //! API uses `AgentManager`), so it stays out of here; everything up to and
 //! including the snapshot + disk clone is shared so the two entry points can
@@ -303,9 +303,23 @@ pub fn control_socket_cmd_with_timeout(
     cmd: &str,
     timeout: std::time::Duration,
 ) -> Result<String> {
+    #[cfg(not(target_os = "windows"))]
     use crate::platform::uds::UdsStream;
     use std::io::{Read, Write};
 
+    #[cfg(target_os = "windows")]
+    let mut stream = {
+        // libkrun's Windows control listener uses loopback TCP and writes its
+        // assigned port to this path; it is not an AF_UNIX socket.
+        let port = std::fs::read_to_string(sock)
+            .map_err(|e| Error::agent("read control port", e.to_string()))?
+            .trim()
+            .parse::<u16>()
+            .map_err(|e| Error::agent("parse control port", e.to_string()))?;
+        std::net::TcpStream::connect(("127.0.0.1", port))
+            .map_err(|e| Error::agent("connect control socket", e.to_string()))?
+    };
+    #[cfg(not(target_os = "windows"))]
     let mut stream = UdsStream::connect(sock)
         .map_err(|e| Error::agent("connect control socket", e.to_string()))?;
     stream.set_read_timeout(Some(timeout)).ok();
@@ -2175,6 +2189,13 @@ pub(crate) fn prepare_forks_reusing(
     reuse_live_snapshot: bool,
     source_policy: ForkSourcePolicy,
 ) -> Result<PreparedForkBatch> {
+    #[cfg(target_os = "windows")]
+    if source_policy != ForkSourcePolicy::Freeze {
+        return Err(Error::config(
+            "branch",
+            "Windows currently requires --freeze-source; source continuation after a branch is not implemented",
+        ));
+    }
     let preparation_started = std::time::Instant::now();
     db.require_completed_resize(golden)?;
     if specs.is_empty() {
@@ -2869,14 +2890,15 @@ fn prepare_clone_from_snapshot(
 
 /// Give the clone its own disks. The source's block workers were quiesced and
 /// flushed at the checkpoint boundary, so the generation is a consistent
-/// backing even when the source has resumed. On Linux each
+/// backing even when the source has resumed. On Linux and Windows each
 /// disk is a qcow2 copy-on-write overlay over the golden's — filesystem
 /// independent, so the overlay starts near-empty and the fork is O(metadata)
-/// regardless of how much data the golden holds. macOS clonefiles the disks
-/// (APFS CoW). Either way the `.formatted` marker is copied so the clone never
-/// reformats and wipes the inherited filesystem.
+/// regardless of how much data the golden holds. Windows keeps the source
+/// frozen; macOS clonefiles the disks (APFS CoW). Either way the `.formatted`
+/// marker is copied so the clone never reformats and wipes the inherited
+/// filesystem.
 fn clone_fork_disks(gdir: &Path, snapshot_dir: &Path, clone_dir: &Path) -> Result<()> {
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    #[cfg(target_os = "windows")]
     let _ = snapshot_dir;
     // The golden's actual disks that exist, resolved by file presence (`.qcow2`
     // if the golden is itself a clone, else `.raw`) — the same single source of
@@ -2901,7 +2923,7 @@ fn clone_fork_disks(gdir: &Path, snapshot_dir: &Path, clone_dir: &Path) -> Resul
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     let disks = fallback_disks();
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
     {
         // Each clone disk is a qcow2 CoW overlay over the golden's disk. Build
         // all overlay specs first so libkrun is loaded once for the batch
@@ -2963,17 +2985,6 @@ fn clone_fork_disks(gdir: &Path, snapshot_dir: &Path, clone_dir: &Path) -> Resul
             }
         }
     }
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-    {
-        // Fork-clone disk overlays rely on libkrun's qcow2 overlay (Linux) or
-        // APFS clonefile (macOS); neither is wired up on Windows.
-        let _ = (&disks, clone_dir);
-        return Err(Error::agent(
-            "clone disk",
-            "live fork is not supported on this platform",
-        ));
-    }
-    #[allow(unreachable_code)]
     Ok(())
 }
 
@@ -3848,7 +3859,6 @@ fn alloc_free_host_port_excluding(reserved: &mut HashSet<u16>) -> Option<u16> {
 /// Read `hex_len/2` random bytes from the host RNG, hex-encoded. Used to seed
 /// each clone's RNG with distinct host entropy.
 fn host_random_hex(hex_len: usize) -> Result<String> {
-    use std::io::Read;
     if hex_len == 0 || !hex_len.is_multiple_of(2) {
         return Err(Error::agent(
             "seed clone identity",
@@ -3856,11 +3866,7 @@ fn host_random_hex(hex_len: usize) -> Result<String> {
         ));
     }
     let mut buf = vec![0u8; hex_len / 2];
-    let mut random = std::fs::File::open("/dev/urandom")
-        .map_err(|e| Error::agent("seed clone identity", e.to_string()))?;
-    random
-        .read_exact(&mut buf)
-        .map_err(|e| Error::agent("seed clone identity", e.to_string()))?;
+    getrandom::fill(&mut buf).map_err(|e| Error::agent("seed clone identity", e.to_string()))?;
     Ok(buf.iter().map(|b| format!("{b:02x}")).collect())
 }
 
