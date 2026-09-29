@@ -4,6 +4,7 @@ param(
     [string]$Smolvm = ".\smolvm.exe",
     [int]$Cpus = 1,
     [int]$MemoryMiB = 512,
+    [int]$RamPayloadMiB = 32,
     [switch]$KeepOnFailure,
     [switch]$HoldBeforeBranch,
     [switch]$FreshOnly,
@@ -90,7 +91,8 @@ function Assert-PauseResume([string]$name, [string]$bootId, [string]$marker) {
 }
 
 function Seed-Workload([string]$name) {
-    Invoke-Smolvm machine exec --name $name -- sh -c 'mkdir -p /workspace/smolvm-checkpoint-test; printf disk-parent > /workspace/smolvm-checkpoint-test/parent; dd if=/dev/urandom of=/tmp/smolvm-ram-payload bs=1M count=32 status=none; sha256sum /tmp/smolvm-ram-payload > /workspace/smolvm-checkpoint-test/ram.sha' | Out-Null
+    $seed = 'mkdir -p /workspace/smolvm-checkpoint-test; printf disk-parent > /workspace/smolvm-checkpoint-test/parent; dd if=/dev/urandom of=/tmp/smolvm-ram-payload bs=1M count={0} status=none; sha256sum /tmp/smolvm-ram-payload > /workspace/smolvm-checkpoint-test/ram.sha' -f $RamPayloadMiB
+    Invoke-Smolvm machine exec --name $name -- sh -c $seed | Out-Null
     Invoke-Smolvm machine exec --name $name -- sh -c 'while :; do printf tick >> /tmp/smolvm-worker-ticks; sleep 1; done </dev/null >/tmp/smolvm-worker.log 2>&1 & echo $! >/tmp/smolvm-worker.pid' | Out-Null
     Assert-Workload $name
 }
