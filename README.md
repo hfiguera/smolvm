@@ -58,6 +58,15 @@ pip install smolmachines     # Python
 cargo add smolmachines       # Rust
 ```
 
+```ts
+import { Machine } from 'smolmachines';
+
+const m = await Machine.create({ image: 'python:3.12-alpine', network: true });
+const r = await m.exec(['python3', '-c', 'print(2 ** 10)']);
+console.log(r.stdout); // 1024
+await m.delete();
+```
+
 Source and docs: [smol-machines/smol](https://github.com/smol-machines/smol) · [smolmachines.com/docs/sdk](https://smolmachines.com/docs/sdk)
 
 Branchable
