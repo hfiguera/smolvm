@@ -172,13 +172,21 @@ jobs:
         run: |
           brew tap libkrun/krun
           brew trust libkrun/krun
-          brew install llvm libepoxy libkrun/krun/virglrenderer
-          brew --prefix virglrenderer
+          brew install llvm libepoxy libkrun/krun/virglrenderer-krun
+          brew --prefix libkrun/krun/virglrenderer-krun
           echo "$(brew --prefix llvm)/bin" >> "$GITHUB_PATH"
 
       - name: Build bundled libkrun (BLK=1 NET=1 GPU=1 INPUT=1)
         run: |
-          make -C libkrun smolvm
+          export LIBCLANG_PATH="$(brew --prefix llvm)/lib"
+          export PKG_CONFIG_PATH="$(brew --prefix libkrun/krun/virglrenderer-krun)/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
+          make -C libkrun BLK=1 NET=1 GPU=1 INPUT=1
+          cp libkrun/target/release/libkrun.2.0.0.dylib lib/libkrun.dylib
+          epoxy="$(brew --prefix libepoxy)/lib/libepoxy.0.dylib"
+          virgl="$(brew --prefix libkrun/krun/virglrenderer-krun)/lib/libvirglrenderer.1.dylib"
+          install_name_tool -change "$epoxy" @loader_path/libepoxy.0.dylib lib/libkrun.dylib
+          install_name_tool -change "$virgl" @loader_path/libvirglrenderer.1.dylib lib/libkrun.dylib
+          codesign --force --sign - lib/libkrun.dylib
           ./scripts/stamp-libkrun-provenance.sh lib --skip-libkrunfw
 
       - uses: actions/upload-artifact@v4
