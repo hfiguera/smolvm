@@ -14,7 +14,8 @@
 smolvm
 ======
 
-**Embed lightweight virtual machines into your software, portable dev environments, and local sandboxing.**
+**Branchable microVMs for AI agents.**
+Embed lightweight virtual machines into your software, portable dev environments, and local sandboxing.
 
 Install
 -------
