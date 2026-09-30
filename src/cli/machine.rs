@@ -2700,6 +2700,44 @@ mod tests {
     }
 
     #[test]
+    fn restore_cache_flags_bound_create_and_checkpoint_warm() {
+        let parse = |argv: &[&str]| TestMachineCli::try_parse_from(argv).map(|cli| cli.command);
+        let Ok(MachineCmd::Create(create)) =
+            parse(&["machine", "create", "--from", "save.checkpoint"])
+        else {
+            panic!("expected create");
+        };
+        assert_eq!(
+            create.restore_cache.cache(),
+            smolvm::portable_checkpoint::RestoreCache::default()
+        );
+        let Ok(MachineCmd::CheckpointWarm(warm)) = parse(&[
+            "machine",
+            "checkpoint-warm",
+            "--from",
+            "save.checkpoint",
+            "--restore-cache-entries",
+            "5",
+            "--restore-cache-gib",
+            "24",
+        ]) else {
+            panic!("expected checkpoint-warm");
+        };
+        let cache = warm.restore_cache.cache();
+        assert_eq!(cache.entries, 5);
+        assert_eq!(cache.max_bytes, 24 * 1024 * 1024 * 1024);
+        assert!(parse(&[
+            "machine",
+            "create",
+            "--from",
+            "save.checkpoint",
+            "--restore-cache-entries",
+            "65",
+        ])
+        .is_err());
+    }
+
+    #[test]
     fn live_resize_accepts_absolute_resource_targets() {
         for (flag, value) in [
             ("--cpus", "4"),
@@ -3638,6 +3676,10 @@ impl ShellCmd {
 ///   smolvm machine create --name webserver --cpus 2 --mem 1024 -p 80:80
 #[derive(Args, Debug)]
 pub struct CreateCmd {
+    /// Restore cache used when `--from` names a stored checkpoint.
+    #[command(flatten)]
+    pub restore_cache: super::pack::RestoreCacheArgs,
+
     /// Name for the machine (auto-generated if omitted)
     #[arg(short = 'n', long, value_name = "NAME", env = smolvm::data::consts::ENV_SMOLVM_MACHINE_NAME)]
     pub name: Option<String>,
@@ -4533,6 +4575,7 @@ impl CreateCmd {
                     sidecar_path,
                     &cache_dir,
                     generation.as_deref(),
+                    self.restore_cache.cache(),
                 )?;
                 Ok((cache_dir.clone(), None))
             } else if smolvm_pack::extract::shared_extract_enabled() {

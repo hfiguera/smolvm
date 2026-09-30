@@ -79,7 +79,8 @@ are private clones, and deleting an entry never changes saved artifacts or VMs.
 Cache publication failures and filesystems without reflinks preserve ordinary
 restore behavior. A zero limit disables cache retention.
 
-The CLI keeps up to three entries (`SMOLVM_RESTORE_CACHE_ENTRIES`, capped at 64)
-within 16 GiB (`SMOLVM_RESTORE_CACHE_MAX_BYTES`). `smolvm machine checkpoint-warm
+The CLI keeps up to three entries within 16 GiB; `machine create --from` and
+`machine checkpoint-warm` take `--restore-cache-entries` (0 to 64) and
+`--restore-cache-gib`. `smolvm machine checkpoint-warm
 --from SAVE.smolcheckpoint` prepares an incremental checkpoint without creating
 or starting a machine.

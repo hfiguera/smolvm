@@ -302,12 +302,43 @@ impl CheckpointLogCmd {
     }
 }
 
+/// How many restored checkpoints stay ready for a fast revisit.
+#[derive(Args, Debug, Clone, Copy)]
+pub struct RestoreCacheArgs {
+    /// Recently restored checkpoints to keep ready, so jumping back to one
+    /// clones it instead of rebuilding its RAM (0 turns the cache off)
+    #[arg(
+        long = "restore-cache-entries",
+        value_name = "N",
+        default_value_t = 3,
+        value_parser = clap::value_parser!(u8).range(0..=64)
+    )]
+    pub entries: u8,
+
+    /// Space the kept checkpoints may hold together, in GiB; each holds a whole
+    /// checkpoint's RAM and disks
+    #[arg(long = "restore-cache-gib", value_name = "GiB", default_value_t = 16)]
+    pub gib: u64,
+}
+
+impl RestoreCacheArgs {
+    pub fn cache(&self) -> smolvm::portable_checkpoint::RestoreCache {
+        smolvm::portable_checkpoint::RestoreCache {
+            entries: usize::from(self.entries),
+            max_bytes: self.gib.saturating_mul(1024 * 1024 * 1024),
+        }
+    }
+}
+
 /// Prewarm the bounded checkpoint cache without reserving a machine or ports.
 #[derive(Args, Debug)]
 pub struct WarmCheckpointCmd {
     /// Incremental .smolcheckpoint directory to prepare
     #[arg(long = "from")]
     pub checkpoint: PathBuf,
+
+    #[command(flatten)]
+    pub restore_cache: RestoreCacheArgs,
 }
 
 impl WarmCheckpointCmd {
@@ -327,6 +358,7 @@ impl WarmCheckpointCmd {
         smolvm::portable_checkpoint::materialize_for_restore(
             &self.checkpoint,
             &staging.path().join("payload"),
+            self.restore_cache.cache(),
         )?;
         println!("Checkpoint preparation completed");
         Ok(())

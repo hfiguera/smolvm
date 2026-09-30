@@ -367,16 +367,37 @@ fn link_completed_memory(_: &Path, _: &Path) -> Result<bool> {
     Ok(false)
 }
 
-/// Default space the restore cache may hold (`SMOLVM_RESTORE_CACHE_MAX_BYTES`).
-const DEFAULT_RESTORE_CACHE_MAX_BYTES: u64 = 16 * 1024 * 1024 * 1024;
+/// How many restored checkpoints stay ready for a fast revisit, and within how
+/// much space. Each entry holds a whole checkpoint's RAM and disks, so the count
+/// alone could keep tens of GiB for large machines.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RestoreCache {
+    /// Checkpoints kept; 0 turns the cache off.
+    pub entries: usize,
+    /// Allocated bytes the kept checkpoints may hold together.
+    pub max_bytes: u64,
+}
+
+impl Default for RestoreCache {
+    fn default() -> Self {
+        Self {
+            entries: 3,
+            max_bytes: 16 * 1024 * 1024 * 1024,
+        }
+    }
+}
 
 /// Materialize a stored checkpoint for restore, diffing against the node's
 /// bounded cache of pristine checkpoint materializations. Exact revisits clone
 /// without rewriting RAM; misses diff against a recent checkpoint. Both the CLI
-/// and API use the same cache policy. SMOLVM_RESTORE_CACHE_ENTRIES defaults to 3;
-/// zero disables retention and falls back to the legacy base.
-pub fn materialize_for_restore(artifact: &Path, cache_dir: &Path) -> Result<()> {
-    materialize_for_restore_at(artifact, cache_dir, None)
+/// and API use the same cache policy; `restore_cache` bounds it, and zero entries
+/// disables retention and falls back to the legacy base.
+pub fn materialize_for_restore(
+    artifact: &Path,
+    cache_dir: &Path,
+    restore_cache: RestoreCache,
+) -> Result<()> {
+    materialize_for_restore_at(artifact, cache_dir, None, restore_cache)
 }
 
 /// [`materialize_for_restore`] for a retained ancestor generation. Ancestors
@@ -385,6 +406,7 @@ pub fn materialize_for_restore_at(
     artifact: &Path,
     cache_dir: &Path,
     generation: Option<&str>,
+    restore_cache: RestoreCache,
 ) -> Result<()> {
     if let Some(generation) = generation {
         return crate::checkpoint_store::materialize_at(artifact, generation, cache_dir)
@@ -393,24 +415,13 @@ pub fn materialize_for_restore_at(
     }
     let base = crate::agent::restore_base_dir();
     let cache = base.with_file_name("_restore-checkpoints");
-    let max_entries = std::env::var("SMOLVM_RESTORE_CACHE_ENTRIES")
-        .ok()
-        .and_then(|value| value.parse::<usize>().ok())
-        .unwrap_or(3)
-        .min(64);
-    // Each entry holds a whole checkpoint's RAM and disks, so the count alone
-    // could keep tens of GiB for large machines.
-    let max_bytes = std::env::var("SMOLVM_RESTORE_CACHE_MAX_BYTES")
-        .ok()
-        .and_then(|value| value.trim().parse::<u64>().ok())
-        .unwrap_or(DEFAULT_RESTORE_CACHE_MAX_BYTES);
     crate::checkpoint_store::materialize_cached(
         artifact,
         cache_dir,
         &cache,
         Some(&base),
-        max_entries,
-        max_bytes,
+        restore_cache.entries,
+        restore_cache.max_bytes,
     )
     .map_err(|error| Error::agent("materialize checkpoint", error.to_string()))?;
     Ok(())
@@ -652,7 +663,12 @@ pub fn restore_from_path_at(
             smolvm_pack::extract::extract_sidecar(artifact, &cache_dir, footer, false, false)
                 .map_err(|error| Error::agent("extract checkpoint", error.to_string()))?;
         } else {
-            materialize_for_restore_at(artifact, &cache_dir, generation.as_deref())?;
+            materialize_for_restore_at(
+                artifact,
+                &cache_dir,
+                generation.as_deref(),
+                RestoreCache::default(),
+            )?;
         }
         log_phase(name, "restore_extract", &mut phase);
         install(&cache_dir, &vm_data, checkpoint)?;
