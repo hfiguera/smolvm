@@ -302,6 +302,37 @@ impl CheckpointLogCmd {
     }
 }
 
+/// Prewarm the bounded checkpoint cache without reserving a machine or ports.
+#[derive(Args, Debug)]
+pub struct WarmCheckpointCmd {
+    /// Incremental .smolcheckpoint directory to prepare
+    #[arg(long = "from")]
+    pub checkpoint: PathBuf,
+}
+
+impl WarmCheckpointCmd {
+    pub fn run(self) -> smolvm::Result<()> {
+        let manifest = smolvm::checkpoint_store::read_manifest(&self.checkpoint)?;
+        let checkpoint = manifest
+            .checkpoint
+            .as_ref()
+            .ok_or_else(|| Error::config("warm checkpoint", "not a live checkpoint"))?;
+        smolvm::portable_checkpoint::validate_compatibility(checkpoint)?;
+        let base = smolvm::agent::restore_base_dir();
+        let parent = base.parent().expect("restore base has parent");
+        std::fs::create_dir_all(parent)?;
+        let staging = tempfile::Builder::new()
+            .prefix(".checkpoint-warm-")
+            .tempdir_in(parent)?;
+        smolvm::portable_checkpoint::materialize_for_restore(
+            &self.checkpoint,
+            &staging.path().join("payload"),
+        )?;
+        println!("Checkpoint preparation completed");
+        Ok(())
+    }
+}
+
 fn record_machine(record: &smolvm::checkpoint_store::LineageRecord) -> &str {
     &record.machine
 }

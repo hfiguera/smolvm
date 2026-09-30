@@ -65,3 +65,19 @@ untrusted checkpoint's author.
 
 The extraction preserves SmolVM's existing index and object formats. It does
 not make VM state portable across incompatible architectures or runtimes.
+
+### Bounded restore cache
+
+`materialize_cached(directory, output, cache_root, legacy_base, max_entries)`
+retains pristine materializations keyed by the complete checkpoint index. Exact
+revisits clone the matching checkpoint instead of rewriting changed RAM chunks
+against a single last-used base. Misses can diff against the most recent entry.
+The cache is LRU-bounded by entry count; each entry can represent multiple GiB.
+A stable root lock covers restore and eviction across processes. Restored files
+are private clones, and deleting an entry never changes saved artifacts or VMs.
+Cache publication failures and filesystems without reflinks preserve ordinary
+restore behavior. A zero limit disables cache retention.
+
+The CLI uses three entries by default (`SMOLVM_RESTORE_CACHE_ENTRIES`, capped at
+64), and `smolvm machine checkpoint-warm --from SAVE.smolcheckpoint` prepares an
+incremental checkpoint without creating or starting a machine.

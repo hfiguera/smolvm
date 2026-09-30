@@ -362,6 +362,9 @@ pub enum MachineCmd {
     /// Save a running machine, including RAM, as a portable checkpoint
     Checkpoint(super::pack::CheckpointCmd),
 
+    /// Prepare an incremental checkpoint for fast restores without starting a VM
+    CheckpointWarm(super::pack::WarmCheckpointCmd),
+
     /// Remove unused objects from a checkpoint store
     CheckpointPrune(super::pack::PruneCheckpointStoreCmd),
 
@@ -456,6 +459,7 @@ impl MachineCmd {
             MachineCmd::Checkpoint(cmd) => cmd.run(),
             MachineCmd::CheckpointPrune(cmd) => cmd.run(),
             MachineCmd::CheckpointLog(cmd) => cmd.run(),
+            MachineCmd::CheckpointWarm(cmd) => cmd.run(),
             MachineCmd::BranchRelease(cmd) => cmd.run(),
             MachineCmd::Stop(cmd) => cmd.run(),
             MachineCmd::Pause(cmd) => cmd.run(),

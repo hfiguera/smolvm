@@ -368,10 +368,10 @@ fn link_completed_memory(_: &Path, _: &Path) -> Result<bool> {
 }
 
 /// Materialize a stored checkpoint for restore, diffing against the node's
-/// restore base (a pristine clone of whatever restored last) so only changed
-/// chunks are written, then keep a clone of this materialization as the next
-/// base. Both the CLI and the API restore paths go through here so the base
-/// policy lives in one place.
+/// bounded cache of pristine checkpoint materializations. Exact revisits clone
+/// without rewriting RAM; misses diff against a recent checkpoint. Both the CLI
+/// and API use the same cache policy. SMOLVM_RESTORE_CACHE_ENTRIES defaults to 3;
+/// zero disables retention and falls back to the legacy base.
 pub fn materialize_for_restore(artifact: &Path, cache_dir: &Path) -> Result<()> {
     materialize_for_restore_at(artifact, cache_dir, None)
 }
@@ -389,26 +389,20 @@ pub fn materialize_for_restore_at(
             .map_err(|error| Error::agent("materialize checkpoint generation", error.to_string()));
     }
     let base = crate::agent::restore_base_dir();
-    let started = std::time::Instant::now();
-    crate::checkpoint_store::materialize_with_base(artifact, cache_dir, Some(&base))
-        .map_err(|error| Error::agent("materialize checkpoint", error.to_string()))?;
-    let materialized_ms = started.elapsed().as_millis() as u64;
-    let started = std::time::Instant::now();
-    // The fresh materialization is exactly this checkpoint's content, so a
-    // clone of it is the base for whatever restores next.
-    let kept = match crate::checkpoint_store::promote_base(artifact, cache_dir, &base) {
-        Ok(kept) => kept,
-        Err(error) => {
-            tracing::warn!(%error, "restore base not refreshed");
-            false
-        }
-    };
-    tracing::info!(
-        materialized_ms,
-        promote_ms = started.elapsed().as_millis() as u64,
-        base_kept = kept,
-        "checkpoint restore materialized"
-    );
+    let cache = base.with_file_name("_restore-checkpoints");
+    let max_entries = std::env::var("SMOLVM_RESTORE_CACHE_ENTRIES")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(3)
+        .min(64);
+    crate::checkpoint_store::materialize_cached(
+        artifact,
+        cache_dir,
+        &cache,
+        Some(&base),
+        max_entries,
+    )
+    .map_err(|error| Error::agent("materialize checkpoint", error.to_string()))?;
     Ok(())
 }
 

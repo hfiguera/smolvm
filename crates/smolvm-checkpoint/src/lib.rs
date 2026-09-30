@@ -15,6 +15,6 @@ pub mod spec {}
 /// Manifest types shared with SmolVM's portable artifact format.
 pub use smolvm_pack::format;
 pub use store::{
-    export, logical_size, materialize, materialize_with_base, promote_base, prune, publish,
-    read_manifest, StoredFile, WriteStats, Writer,
+    export, logical_size, materialize, materialize_cached, materialize_with_base, promote_base,
+    prune, publish, read_manifest, StoredFile, WriteStats, Writer,
 };

@@ -1458,6 +1458,148 @@ pub fn materialize_at(
     materialize_generation(directory, Some(generation), output, None)
 }
 
+/// Restore with a bounded LRU of pristine materializations keyed by the full
+/// checkpoint index. Revisiting a checkpoint clones its exact RAM/disk state;
+/// a miss can still diff against the most recently used entry or legacy base.
+/// The cache owns only clones, never writable VM files. One stable root lock
+/// covers selection, cloning, publication and eviction across processes.
+/// Cache setup/publication failures degrade to ordinary restoration.
+pub fn materialize_cached(
+    directory: &Path,
+    output: &Path,
+    cache_root: &Path,
+    legacy_base: Option<&Path>,
+    max_entries: usize,
+) -> io::Result<PackManifest> {
+    if max_entries == 0 {
+        return materialize_with_base(directory, output, legacy_base);
+    }
+    let index = read_index(directory)?;
+    let key = digest(&serde_json::to_vec(&index)?);
+    let setup = (|| {
+        fs::create_dir_all(cache_root)?;
+        lock_base(&cache_root.join("cache"), true)
+    })();
+    let _guard = match setup {
+        Ok(guard) => guard,
+        Err(error) => {
+            tracing::warn!(%error, "restore cache unavailable");
+            return materialize_with_base(directory, output, legacy_base);
+        }
+    };
+    let exact = cache_root.join(&key);
+    let mut entries = Vec::new();
+    for entry in fs::read_dir(cache_root)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if entry.file_type()?.is_dir()
+            && name.len() == 64
+            && name.bytes().all(|b| b.is_ascii_hexdigit())
+        {
+            let used = fs::metadata(entry.path().join(".used"))
+                .and_then(|m| m.modified())
+                .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+            entries.push((used, entry.path()));
+        } else if entry.file_type()?.is_dir()
+            && name.split_once('.').is_some_and(|(key, suffix)| {
+                key.len() == 64
+                    && key.bytes().all(|b| b.is_ascii_hexdigit())
+                    && (suffix.starts_with("new-") || suffix.starts_with("old-"))
+            })
+        {
+            // Only our atomic publication leftovers; the root lock excludes
+            // another live cache publisher.
+            fs::remove_dir_all(entry.path())?;
+        }
+    }
+    entries.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+    let exact_exists = entries.iter().any(|(_, path)| *path == exact);
+    let identities = base_identities(&exact);
+    let hit = exact_exists
+        && read_index(&exact).ok().is_some_and(|cached| {
+            serde_json::to_vec(&cached).ok() == serde_json::to_vec(&index).ok()
+        })
+        && index.files.iter().all(|file| {
+            identities
+                .get(&file.path)
+                .zip(file_identity(&exact.join(&file.path)))
+                .is_some_and(|(recorded, current)| *recorded == current)
+        });
+    // Enforce the limit before allocating a new materialization. Keep the
+    // most recent entry as the differential base until it has been consumed.
+    let keep_before = max_entries
+        .saturating_sub(usize::from(!exact_exists))
+        .max(1);
+    while entries.len() > keep_before {
+        let position = entries
+            .iter()
+            .position(|(_, path)| *path != exact)
+            .unwrap_or(0);
+        let (_, victim) = entries.remove(position);
+        remove_cache_entry(&victim)?;
+    }
+    let base = if exact_exists {
+        Some(exact.as_path())
+    } else {
+        entries
+            .last()
+            .map(|(_, path)| path.as_path())
+            .or(legacy_base)
+    };
+    let started = std::time::Instant::now();
+    let manifest = materialize_with_base(directory, output, base)?;
+    let materialized_ms = started.elapsed().as_millis();
+    let started = std::time::Instant::now();
+    let cached = if hit {
+        true
+    } else {
+        match promote_base(directory, output, &exact) {
+            Ok(cached) => cached,
+            Err(error) => {
+                tracing::warn!(%error, "restore cache publication failed");
+                false
+            }
+        }
+    };
+    if cached {
+        if let Err(error) = fs::write(exact.join(".used"), b"") {
+            tracing::warn!(%error, "restore cache recency update failed");
+        }
+        entries.retain(|(_, path)| *path != exact);
+        while entries.len() >= max_entries {
+            let (_, victim) = entries.remove(0);
+            if let Err(error) = remove_cache_entry(&victim) {
+                tracing::warn!(%error, "restore cache eviction failed");
+            }
+        }
+    }
+    tracing::info!(
+        cache_hit = hit,
+        cached,
+        materialized_ms,
+        promote_ms = started.elapsed().as_millis(),
+        "checkpoint restore cache"
+    );
+    Ok(manifest)
+}
+
+// Call only while holding the cache root's exclusive lock. No cache reader
+// can still own this per-entry lock, so its inode can be reclaimed as well.
+fn remove_cache_entry(path: &Path) -> io::Result<()> {
+    fs::remove_dir_all(path)?;
+    let mut lock_name = path
+        .file_name()
+        .ok_or_else(|| invalid("cache entry"))?
+        .to_os_string();
+    lock_name.push(".lock");
+    match fs::remove_file(path.with_file_name(lock_name)) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
 /// Like [`materialize`], but when `base` holds a pristine materialization of
 /// another checkpoint (see [`promote_base`]), every file that exists in both
 /// starts as a clone of the base's copy and only the chunks whose content hash
@@ -1540,7 +1682,9 @@ fn materialize_generation(
         // Size the file first: ranges no worker writes stay holes (or keep
         // the base's bytes, which the diff below has checked are identical).
         file.set_len(entry.size)?;
-        let data_map = cloned.then(|| chunk_data_map(&file, entry.size)).flatten();
+        let data_map = (cloned && !trusted)
+            .then(|| chunk_data_map(&file, entry.size))
+            .flatten();
         let data_map = data_map.as_ref();
         let base_chunks: &[Option<String>] = match (&base_entry, cloned) {
             (Some((_, base)), true) => &base.chunks,
@@ -2074,6 +2218,136 @@ pub fn export_at(directory: &Path, generation: Option<&str>, output: &Path) -> i
 
 #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 mod tests {
+    #[test]
+    fn exact_cache_reuses_alternating_checkpoints_and_bounds_retention() {
+        let root = tempfile::tempdir().unwrap();
+        let objects = root.path().join("objects");
+        let cache = root.path().join("restore-cache");
+        let sources: Vec<_> = (0..3)
+            .map(|i| {
+                let saved = root.path().join(format!("saved-{i}"));
+                let bytes = vec![i + 1; CHUNK_SIZE + 17];
+                capture(&objects, &saved, &bytes);
+                (saved, bytes)
+            })
+            .collect();
+        let key = |saved: &Path| digest(&serde_json::to_vec(&read_index(saved).unwrap()).unwrap());
+        for (i, (saved, bytes)) in sources.iter().take(2).enumerate() {
+            let output = root.path().join(format!("first-{i}"));
+            materialize_cached(saved, &output, &cache, None, 2).unwrap();
+            assert_eq!(
+                fs::read(output.join("checkpoint/memory.bin")).unwrap(),
+                *bytes
+            );
+        }
+        if !cache.join(key(&sources[0].0)).exists() {
+            assert!(std::env::var_os("SMOLVM_TEST_REQUIRE_REFLINK").is_none());
+            return;
+        }
+        // Exact revisits must not decode objects, and modifying the restored
+        // VM must never modify either the cached snapshot or other restores.
+        for i in [0, 1, 0] {
+            let (saved, bytes) = &sources[i];
+            fs::rename(saved.join("objects"), saved.join("objects-hidden")).unwrap();
+            let output = root.path().join(format!("revisit-{i}-{}", rand_suffix()));
+            materialize_cached(saved, &output, &cache, None, 2).unwrap();
+            assert_eq!(
+                fs::read(output.join("checkpoint/memory.bin")).unwrap(),
+                *bytes
+            );
+            fs::write(output.join("checkpoint/memory.bin"), b"guest modification").unwrap();
+            fs::rename(saved.join("objects-hidden"), saved.join("objects")).unwrap();
+        }
+        materialize_cached(&sources[2].0, &root.path().join("third"), &cache, None, 2).unwrap();
+        assert!(cache.join(key(&sources[0].0)).exists());
+        assert!(!cache.join(key(&sources[1].0)).exists());
+        assert!(cache.join(key(&sources[2].0)).exists());
+        // Eviction never invalidates a saved artifact.
+        let output = root.path().join("evicted-again");
+        materialize_cached(&sources[1].0, &output, &cache, None, 2).unwrap();
+        assert_eq!(
+            fs::read(output.join("checkpoint/memory.bin")).unwrap(),
+            sources[1].1
+        );
+    }
+
+    fn rand_suffix() -> u128 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    }
+
+    #[test]
+    fn exact_cache_repairs_modified_memory_and_handles_unavailable_cache() {
+        let root = tempfile::tempdir().unwrap();
+        let saved = root.path().join("saved");
+        let cache = root.path().join("restore-cache");
+        let bytes = vec![42; CHUNK_SIZE + 7];
+        capture(&root.path().join("objects"), &saved, &bytes);
+        materialize_cached(&saved, &root.path().join("first"), &cache, None, 1).unwrap();
+        let key = digest(&serde_json::to_vec(&read_index(&saved).unwrap()).unwrap());
+        let memory = cache.join(key).join("checkpoint/memory.bin");
+        if memory.exists() {
+            fs::write(&memory, b"corrupt and truncated").unwrap();
+            let output = root.path().join("repaired");
+            materialize_cached(&saved, &output, &cache, None, 1).unwrap();
+            assert_eq!(
+                fs::read(output.join("checkpoint/memory.bin")).unwrap(),
+                bytes
+            );
+            assert_eq!(fs::read(memory).unwrap(), bytes);
+        }
+        let unavailable = root.path().join("not-a-directory");
+        fs::write(&unavailable, b"x").unwrap();
+        let output = root.path().join("fallback");
+        materialize_cached(&saved, &output, &unavailable, None, 1).unwrap();
+        assert_eq!(
+            fs::read(output.join("checkpoint/memory.bin")).unwrap(),
+            bytes
+        );
+        let disabled = root.path().join("disabled-cache");
+        materialize_cached(&saved, &root.path().join("disabled"), &disabled, None, 0).unwrap();
+        assert!(!disabled.exists());
+    }
+
+    #[test]
+    fn exact_cache_concurrent_restores_and_eviction_preserve_content() {
+        let root = tempfile::tempdir().unwrap();
+        let cache = root.path().join("restore-cache");
+        let sources: Vec<_> = (0..3)
+            .map(|i| {
+                let saved = root.path().join(format!("saved-{i}"));
+                let bytes = vec![i + 1; CHUNK_SIZE + 17];
+                capture(&root.path().join("objects"), &saved, &bytes);
+                (saved, bytes)
+            })
+            .collect();
+        std::thread::scope(|scope| {
+            for (i, (saved, bytes)) in sources.iter().enumerate() {
+                let cache = &cache;
+                let root = root.path();
+                scope.spawn(move || {
+                    for n in 0..3 {
+                        let output = root.join(format!("out-{i}-{n}"));
+                        materialize_cached(saved, &output, cache, None, 1).unwrap();
+                        assert_eq!(
+                            fs::read(output.join("checkpoint/memory.bin")).unwrap(),
+                            *bytes
+                        );
+                    }
+                });
+            }
+        });
+        assert!(
+            fs::read_dir(&cache)
+                .unwrap()
+                .filter(|e| e.as_ref().unwrap().file_type().unwrap().is_dir())
+                .count()
+                <= 1
+        );
+    }
+
     #[test]
     fn replacing_restore_base_keeps_the_same_lock_domain() {
         let root = tempfile::tempdir().unwrap();
