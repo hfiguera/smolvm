@@ -2346,7 +2346,7 @@ async fn create_machine_inner(
         let overlay_gb = restored_overlay_gb;
         move || {
             if let Some(image) = seed_image {
-                let seeded = std::env::current_exe()
+                let seeded = crate::image_seed::builder_exe()
                     .map_err(|e| crate::Error::config("image seed", e.to_string()))
                     .and_then(|exe| {
                         crate::image_seed::seed_storage(
@@ -3167,7 +3167,7 @@ pub async fn start_machine(
             }
         }
         if let Some(image) = seed_image {
-            let seeded = std::env::current_exe()
+            let seeded = crate::image_seed::builder_exe()
                 .map_err(|e| crate::Error::config("image seed", e.to_string()))
                 .and_then(|exe| {
                     crate::image_seed::seed_storage(&exe, &name_clone, &image, &seed_auth, None, None)

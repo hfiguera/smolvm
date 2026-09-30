@@ -20,26 +20,71 @@
 //! copy the whole disk chain, so they do not depend on a seed staying on disk.
 //! Seeding is best-effort: any failure falls back to the in-guest pull.
 //! `SMOLVM_IMAGE_SEEDS=0` turns it off.
+//!
+//! Without a sized storage template (macOS, or an SDK install that ships none)
+//! the seed is the builder's raw disk instead, and each machine takes a
+//! copy-on-write clone of it: an APFS clone on macOS, a reflink or sparse copy
+//! on Linux. Clones are independent of the seed, so eviction never has to keep
+//! one alive.
 
-#[cfg(target_os = "linux")]
-pub use linux::{
+#[cfg(unix)]
+pub use imp::{
     revalidate_seed, seed_root, seed_storage, seedable_image, wants_seed, SEED_MACHINE_PREFIX,
 };
 
-/// Seeds need the Linux storage-template overlay; elsewhere nothing seeds.
-#[cfg(not(target_os = "linux"))]
+/// The smolvm binary that builds seeds. The SDKs run inside `node` or `python`,
+/// so their own executable is not smolvm; they point `SMOLVM_BOOT_BINARY` at the
+/// smolvm they bundle. The CLI and the server build with themselves.
+pub fn builder_exe() -> std::io::Result<std::path::PathBuf> {
+    match std::env::var_os("SMOLVM_BOOT_BINARY") {
+        Some(path) => Ok(path.into()),
+        None => std::env::current_exe(),
+    }
+}
+
+/// Give a fresh registry-image machine a seeded storage disk before its first
+/// start. Best-effort: without a seed the guest pulls as before.
+pub fn seed_first_start(
+    name: &str,
+    record: &crate::config::VmRecord,
+    from_snapshot: bool,
+    proxy: Option<&str>,
+    no_proxy: Option<&str>,
+) {
+    let Some(image) = wants_seed(name, record, from_snapshot) else {
+        return;
+    };
+    let seeded = builder_exe()
+        .map_err(|e| crate::Error::config("image seed", e.to_string()))
+        .and_then(|exe| {
+            seed_storage(
+                &exe,
+                name,
+                &image,
+                &crate::registry::PullAuth::FromConfig,
+                proxy,
+                no_proxy,
+            )
+        });
+    if let Err(error) = seeded {
+        tracing::warn!(machine = name, %error, "no image seed; pulling in the guest");
+    }
+}
+
+/// Seeds need a Unix host; elsewhere nothing seeds.
+#[cfg(not(unix))]
 pub fn wants_seed(_: &str, _: &crate::config::VmRecord, _: bool) -> Option<String> {
     None
 }
 
-/// Seeds need the Linux storage-template overlay; elsewhere nothing seeds.
-#[cfg(not(target_os = "linux"))]
+/// Seeds need a Unix host; elsewhere nothing seeds.
+#[cfg(not(unix))]
 pub fn seedable_image(_: &str, _: Option<&str>, _: Option<u64>) -> Option<String> {
     None
 }
 
-/// Seeds need the Linux storage-template overlay; elsewhere nothing seeds.
-#[cfg(not(target_os = "linux"))]
+/// Seeds need a Unix host; elsewhere nothing seeds.
+#[cfg(not(unix))]
 pub fn seed_storage(
     _: &std::path::Path,
     _: &str,
@@ -51,14 +96,14 @@ pub fn seed_storage(
     Ok(false)
 }
 
-#[cfg(not(target_os = "linux"))]
-/// Seeds only exist on Linux, so other platforms have nothing to revalidate.
+#[cfg(not(unix))]
+/// Seeds need a Unix host, so other platforms have nothing to revalidate.
 pub fn revalidate_seed(_: &str, _: &str, _: &crate::registry::PullAuth) -> crate::Result<bool> {
     Ok(false)
 }
 
-#[cfg(target_os = "linux")]
-mod linux {
+#[cfg(unix)]
+mod imp {
     use std::os::fd::AsRawFd;
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
     use std::path::{Path, PathBuf};
@@ -143,38 +188,36 @@ mod linux {
         proxy: Option<&str>,
         no_proxy: Option<&str>,
     ) -> Result<bool> {
-        let Some(template) = storage_template() else {
-            return Ok(false);
-        };
+        let template = storage_template();
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .map_err(|e| Error::config("image seed", e.to_string()))?;
         let resolve = || rt.block_on(crate::image_store::authorized_reference_digest(image, auth));
         let digest = resolve()?;
-        let key = seed_key(image, &digest, &template)?;
+        let key = seed_key(image, &digest, template.as_deref())?;
         let root = seed_root();
         std::fs::create_dir_all(&root).map_err(|e| Error::config("image seed", e.to_string()))?;
         std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o711))
             .map_err(|e| Error::config("image seed", e.to_string()))?;
-        let seed = root.join(&key).join("storage.qcow2");
+        let key_dir = root.join(&key);
         let mut built = false;
         // A cache hit holds the shared lock through overlay publication. Prune
         // takes the exclusive lock before scanning backing references, so it
         // cannot miss an overlay being created and then delete its base.
         let mut cache = CacheLock::shared(&root)?;
-        if !seed.exists() {
+        if seed_disk(&key_dir).is_none() {
             drop(cache);
             // One builder per image; concurrent first starts wait for it and
             // then share it. This lock file is permanent: unlinking a locked
             // file would let new callers lock a different inode for this key.
             let _build = Lock::exclusive(&root.join(format!("{key}.lock")))?;
-            if !seed.exists() {
-                build_seed(exe, image, auth, &key, &seed, proxy, no_proxy)?;
+            if seed_disk(&key_dir).is_none() {
+                build_seed(exe, image, auth, &key, &key_dir, proxy, no_proxy)?;
                 // The builder pulled the tag, not the digest. If the tag moved
                 // in the meantime, discard the seed rather than miskey it.
                 if resolve()? != digest {
-                    let _ = std::fs::remove_dir_all(seed.parent().expect("seed path has a parent"));
+                    let _ = std::fs::remove_dir_all(&key_dir);
                     return Err(Error::config(
                         "image seed",
                         format!("{image} moved during the seed build"),
@@ -184,17 +227,17 @@ mod linux {
             }
             cache = CacheLock::shared(&root)?;
         }
-        if !seed.exists() {
+        let Some((seed, format)) = seed_disk(&key_dir) else {
             return Err(Error::config(
                 "image seed",
                 "seed disappeared before overlay creation",
             ));
-        }
+        };
         let dir = crate::agent::ensure_vm_dir(name)
             .map_err(|e| Error::config("image seed", e.to_string()))?;
         let storage = dir
             .join(crate::storage::STORAGE_DISK_FILENAME)
-            .with_extension(DiskFormat::Qcow2.extension());
+            .with_extension(format.extension());
         // Build under a unique name and publish with a no-replace hard link.
         // A failed libkrun call cannot leave a partial final disk, and a
         // concurrent start cannot have its finished disk removed or replaced.
@@ -203,14 +246,18 @@ mod linux {
             .unwrap_or_default()
             .as_nanos();
         let staging = dir.join(format!(
-            ".seed-overlay-{}-{nonce}.qcow2",
-            std::process::id()
+            ".seed-disk-{}-{nonce}.{}",
+            std::process::id(),
+            format.extension()
         ));
-        let created = crate::agent::create_disk_overlays(&[(
-            staging.clone(),
-            seed.clone(),
-            DiskFormat::Qcow2,
-        )]);
+        let created = attach(&staging, &seed, format).and_then(|()| {
+            // A clone keeps no link to its seed; record it for revalidation.
+            if matches!(format, DiskFormat::Raw) {
+                std::fs::write(source_marker(&storage), seed.as_os_str().as_encoded_bytes())
+                    .map_err(|e| Error::config("image seed", e.to_string()))?;
+            }
+            Ok(())
+        });
         if let Err(error) = created {
             let _ = std::fs::remove_file(staging);
             return Err(error);
@@ -219,6 +266,12 @@ mod linux {
             .map_err(|e| Error::config("image seed", e.to_string()));
         let _ = std::fs::remove_file(staging);
         published?;
+        if matches!(format, DiskFormat::Raw) {
+            // A raw disk without its format marker counts as blank, and the
+            // launcher would copy the empty template over the clone.
+            std::fs::write(storage.with_extension("formatted"), "1")
+                .map_err(|e| Error::config("image seed", e.to_string()))?;
+        }
         // Recently used seeds are the last to be evicted.
         let _ =
             std::fs::File::open(&seed).and_then(|f| f.set_modified(std::time::SystemTime::now()));
@@ -233,33 +286,43 @@ mod linux {
     /// at start. A moved tag or denied request discards the untouched overlay;
     /// the start path can then seed again or let the guest pull normally.
     pub fn revalidate_seed(name: &str, image: &str, auth: &PullAuth) -> Result<bool> {
-        let storage = crate::agent::vm_data_dir(name)
-            .join(crate::storage::STORAGE_DISK_FILENAME)
-            .with_extension(DiskFormat::Qcow2.extension());
-        let Some(backing) = qcow2_backing(&storage) else {
-            return Ok(false);
+        let dir = crate::agent::vm_data_dir(name);
+        let base = dir.join(crate::storage::STORAGE_DISK_FILENAME);
+        let qcow2 = base.with_extension(DiskFormat::Qcow2.extension());
+        let (storage, backing) = match qcow2_backing(&qcow2) {
+            Some(backing) => (qcow2, backing),
+            None => match std::fs::read(source_marker(&base)) {
+                // SAFETY: written by `seed_storage` from an `OsStr` on this host.
+                Ok(bytes) => (
+                    base.clone(),
+                    PathBuf::from(unsafe {
+                        std::ffi::OsString::from_encoded_bytes_unchecked(bytes)
+                    }),
+                ),
+                Err(_) => return Ok(false),
+            },
         };
         let root = seed_root();
         let Some(key_dir) = backing.parent() else {
             return Ok(false);
         };
         if key_dir.parent() != Some(root.as_path())
-            || backing.file_name().is_none_or(|n| n != "storage.qcow2")
+            || seed_disk(key_dir).is_none_or(|(seed, _)| seed.file_name() != backing.file_name())
         {
             return Ok(false);
         }
         let expected = (|| -> Result<PathBuf> {
-            let template = storage_template()
-                .ok_or_else(|| Error::config("image seed", "storage template unavailable"))?;
+            let template = storage_template();
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
                 .map_err(|e| Error::config("image seed", e.to_string()))?;
             let digest =
                 rt.block_on(crate::image_store::authorized_reference_digest(image, auth))?;
-            Ok(root
-                .join(seed_key(image, &digest, &template)?)
-                .join("storage.qcow2"))
+            let key_dir = root.join(seed_key(image, &digest, template.as_deref())?);
+            seed_disk(&key_dir)
+                .map(|(seed, _)| seed)
+                .ok_or_else(|| Error::config("image seed", "no seed for the authorized digest"))
         })();
         match expected {
             Ok(expected)
@@ -273,6 +336,7 @@ mod linux {
                 // leave unauthorized or stale image contents for the guest.
                 std::fs::remove_file(&storage)
                     .map_err(|e| Error::config("image seed", e.to_string()))?;
+                let _ = std::fs::remove_file(source_marker(&base));
                 result?;
                 Ok(false)
             }
@@ -286,14 +350,15 @@ mod linux {
         image: &str,
         auth: &PullAuth,
         key: &str,
-        seed: &Path,
+        key_dir: &Path,
         proxy: Option<&str>,
         no_proxy: Option<&str>,
     ) -> Result<()> {
         reap_stale_builders(exe);
         let tmp = format!("{SEED_MACHINE_PREFIX}{}-{}", &key[..16], std::process::id());
         let _ = run(exe, &["machine", "delete", "--name", &tmp, "-f"]);
-        let staging = seed.with_extension(format!("qcow2.{}", std::process::id()));
+        // Set once the builder's disk format is known.
+        let mut staged: Option<(PathBuf, PathBuf)> = None;
         let started = std::time::Instant::now();
         let built = (|| -> Result<()> {
             run(
@@ -331,25 +396,32 @@ mod linux {
                 ));
             }
             run(exe, &["machine", "stop", "--name", &tmp])?;
-            let disk = crate::agent::vm_data_dir(&tmp)
-                .join(crate::storage::STORAGE_DISK_FILENAME)
-                .with_extension(DiskFormat::Qcow2.extension());
-            if !disk.exists() {
-                return Err(Error::config(
-                    "image seed",
-                    "the builder's storage is not a template overlay",
-                ));
-            }
-            let dir = seed.parent().expect("seed path has a parent");
-            std::fs::create_dir_all(dir).map_err(|e| Error::config("image seed", e.to_string()))?;
-            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
+            // A template overlay where the host has a sized template, else the
+            // builder's own raw disk.
+            let builder = crate::agent::vm_data_dir(&tmp);
+            let (disk, format) = seed_disk_in(&builder, crate::storage::STORAGE_DISK_FILENAME)
+                .ok_or_else(|| Error::config("image seed", "the builder has no storage disk"))?;
+            std::fs::create_dir_all(key_dir)
                 .map_err(|e| Error::config("image seed", e.to_string()))?;
-            std::fs::rename(&disk, &staging).map_err(|e| Error::config("image seed", e.to_string()))
+            std::fs::set_permissions(key_dir, std::fs::Permissions::from_mode(0o700))
+                .map_err(|e| Error::config("image seed", e.to_string()))?;
+            let seed = key_dir.join(seed_file(format));
+            let staging =
+                seed.with_extension(format!("{}.{}", format.extension(), std::process::id()));
+            std::fs::rename(&disk, &staging)
+                .map_err(|e| Error::config("image seed", e.to_string()))?;
+            staged = Some((staging, seed));
+            Ok(())
         })();
         let _ = run(exe, &["machine", "delete", "--name", &tmp, "-f"]);
-        let published = built.and_then(|()| publish(&staging, seed));
+        let published = built.and_then(|()| {
+            let (staging, seed) = staged.as_ref().expect("a built seed is staged");
+            publish(staging, seed)
+        });
         if published.is_err() {
-            let _ = std::fs::remove_file(&staging);
+            if let Some((staging, _)) = &staged {
+                let _ = std::fs::remove_file(staging);
+            }
         }
         published?;
         tracing::info!(
@@ -382,9 +454,26 @@ mod linux {
 
     /// A seed depends on the exact template bytes under it, the image content, the
     /// guest architecture and the guest's storage layout.
-    pub(super) fn seed_key(image: &str, digest: &str, template: &Path) -> Result<String> {
-        let meta =
-            std::fs::metadata(template).map_err(|e| Error::config("image seed", e.to_string()))?;
+    pub(super) fn seed_key(image: &str, digest: &str, template: Option<&Path>) -> Result<String> {
+        // Without a template the disk is formatted by this smolvm version,
+        // which the key already carries.
+        let (path, identity) = match template {
+            Some(template) => {
+                let meta = std::fs::metadata(template)
+                    .map_err(|e| Error::config("image seed", e.to_string()))?;
+                (
+                    template.display().to_string(),
+                    format!(
+                        "{}:{}:{}:{}",
+                        meta.dev(),
+                        meta.ino(),
+                        meta.len(),
+                        meta.mtime()
+                    ),
+                )
+            }
+            None => (String::from("no-template"), String::new()),
+        };
         let mut hash = Sha256::new();
         for part in [
             SEED_FORMAT,
@@ -392,14 +481,8 @@ mod linux {
             image,
             digest,
             std::env::consts::ARCH,
-            &template.display().to_string(),
-            &format!(
-                "{}:{}:{}:{}",
-                meta.dev(),
-                meta.ino(),
-                meta.len(),
-                meta.mtime()
-            ),
+            &path,
+            &identity,
         ] {
             hash.update(part.as_bytes());
             hash.update([0]);
@@ -407,15 +490,85 @@ mod linux {
         Ok(hex::encode(hash.finalize()))
     }
 
-    /// The storage template, when it can back a copy-on-write disk (sized at
-    /// install time, the same condition as a machine's own template overlay).
+    /// The storage template a machine's disk starts from, if the host has one.
+    /// Its identity is part of the seed key.
     fn storage_template() -> Option<PathBuf> {
-        let template = smolvm_pack::assets::find_existing_template("storage-template.ext4")?;
-        let size = crate::storage::DEFAULT_STORAGE_SIZE_GIB * 1024 * 1024 * 1024;
-        if std::fs::metadata(&template).ok()?.len() < size {
-            return None;
+        smolvm_pack::assets::find_existing_template("storage-template.ext4")?
+            .canonicalize()
+            .ok()
+    }
+
+    /// A seed's file name: `storage.qcow2` over the template, `storage.raw` as a
+    /// standalone disk.
+    fn seed_file(format: DiskFormat) -> String {
+        format!("storage.{}", format.extension())
+    }
+
+    /// The published seed in `key_dir`, and its format.
+    fn seed_disk(key_dir: &Path) -> Option<(PathBuf, DiskFormat)> {
+        seed_disk_in(key_dir, "storage")
+    }
+
+    #[cfg(test)]
+    pub(super) fn seed_disk_for_test(key_dir: &Path) -> Option<PathBuf> {
+        seed_disk(key_dir).map(|(seed, _)| seed)
+    }
+
+    /// The storage disk named `stem` in `dir` (either extension), preferring a
+    /// template overlay.
+    fn seed_disk_in(dir: &Path, stem: &str) -> Option<(PathBuf, DiskFormat)> {
+        let base = dir.join(stem);
+        [DiskFormat::Qcow2, DiskFormat::Raw]
+            .into_iter()
+            .map(|format| (base.with_extension(format.extension()), format))
+            .find(|(path, _)| path.is_file())
+    }
+
+    /// Where a raw clone records the seed it came from.
+    fn source_marker(storage: &Path) -> PathBuf {
+        storage.with_extension("seed")
+    }
+
+    /// Make `staging` a new machine's storage on `seed`: a qcow2 overlay on a
+    /// template-overlay seed, a copy-on-write clone of a raw one.
+    fn attach(staging: &Path, seed: &Path, format: DiskFormat) -> Result<()> {
+        if matches!(format, DiskFormat::Qcow2) {
+            return crate::agent::create_disk_overlays(&[(
+                staging.to_path_buf(),
+                seed.to_path_buf(),
+                DiskFormat::Qcow2,
+            )]);
         }
-        template.canonicalize().ok()
+        clone_raw(seed, staging)?;
+        // The clone keeps the seed's read-only mode; the machine writes its disk.
+        std::fs::set_permissions(staging, std::fs::Permissions::from_mode(0o600))
+            .map_err(|e| Error::config("image seed", e.to_string()))
+    }
+
+    /// An APFS clone. Never a full copy: that would write the whole 20 GiB disk,
+    /// far slower than the pull it replaces.
+    #[cfg(target_os = "macos")]
+    fn clone_raw(seed: &Path, staging: &Path) -> Result<()> {
+        use std::os::unix::ffi::OsStrExt;
+        let path = |p: &Path| {
+            std::ffi::CString::new(p.as_os_str().as_bytes())
+                .map_err(|e| Error::config("image seed", e.to_string()))
+        };
+        let (src, dst) = (path(seed)?, path(staging)?);
+        if unsafe { libc::clonefile(src.as_ptr(), dst.as_ptr(), 0) } != 0 {
+            return Err(Error::config(
+                "image seed",
+                format!("clone seed: {}", std::io::Error::last_os_error()),
+            ));
+        }
+        Ok(())
+    }
+
+    /// A reflink where the filesystem has one, else a copy of only the seed's
+    /// data (the pulled image), skipping its holes.
+    #[cfg(not(target_os = "macos"))]
+    fn clone_raw(seed: &Path, staging: &Path) -> Result<()> {
+        crate::disk_utils::clone_or_copy_file(seed, staging)
     }
 
     /// `~/.cache/smolvm/image-seeds`.
@@ -445,7 +598,7 @@ mod linux {
         };
         let mut seeds: Vec<(PathBuf, u64, std::time::SystemTime)> = entries
             .flatten()
-            .map(|entry| entry.path().join("storage.qcow2"))
+            .filter_map(|entry| seed_disk(&entry.path()).map(|(seed, _)| seed))
             .filter_map(|seed| {
                 let meta = std::fs::metadata(&seed).ok()?;
                 Some((seed, meta.blocks() * 512, meta.modified().ok()?))
@@ -567,6 +720,9 @@ mod linux {
         let out = std::process::Command::new(exe)
             .args(args)
             .env("SMOLVM_IMAGE_SEEDS", "0")
+            // An embedder's helper variable would tie the builder VM's life to
+            // this short-lived CLI process, killing it as soon as `start` returns.
+            .env_remove("SMOLVM_BOOT_BINARY")
             .stdin(std::process::Stdio::null())
             .output()
             .map_err(|e| Error::config("image seed", e.to_string()))?;
@@ -648,19 +804,40 @@ mod linux {
     }
 }
 
-#[cfg(all(test, target_os = "linux"))]
+#[cfg(all(test, unix))]
 mod tests {
-    use super::linux::*;
+    use super::imp::*;
     use std::path::PathBuf;
 
     #[test]
     fn key_changes_with_digest_and_image() {
         let template = std::env::temp_dir().join("seed-key-template");
         std::fs::write(&template, b"t").unwrap();
-        let a = seed_key("alpine", "sha256:aa", &template).unwrap();
-        assert_eq!(a, seed_key("alpine", "sha256:aa", &template).unwrap());
-        assert_ne!(a, seed_key("alpine", "sha256:bb", &template).unwrap());
-        assert_ne!(a, seed_key("busybox", "sha256:aa", &template).unwrap());
+        let template = Some(template.as_path());
+        let a = seed_key("alpine", "sha256:aa", template).unwrap();
+        assert_eq!(a, seed_key("alpine", "sha256:aa", template).unwrap());
+        assert_ne!(a, seed_key("alpine", "sha256:bb", template).unwrap());
+        assert_ne!(a, seed_key("busybox", "sha256:aa", template).unwrap());
+        // A raw seed built without a template never answers for one built on it.
+        let bare = seed_key("alpine", "sha256:aa", None).unwrap();
+        assert_ne!(a, bare);
+        assert_eq!(bare, seed_key("alpine", "sha256:aa", None).unwrap());
+    }
+
+    #[test]
+    fn finds_a_seed_of_either_format_preferring_the_overlay() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(seed_disk_for_test(dir.path()).is_none());
+        std::fs::write(dir.path().join("storage.raw"), b"raw").unwrap();
+        assert_eq!(
+            seed_disk_for_test(dir.path()),
+            Some(dir.path().join("storage.raw"))
+        );
+        std::fs::write(dir.path().join("storage.qcow2"), b"qcow2").unwrap();
+        assert_eq!(
+            seed_disk_for_test(dir.path()),
+            Some(dir.path().join("storage.qcow2"))
+        );
     }
 
     #[test]
