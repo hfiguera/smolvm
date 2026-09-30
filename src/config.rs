@@ -587,6 +587,12 @@ pub struct VmRecord {
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub detached: bool,
 
+    /// Restored from a checkpoint as the same machine going back in time, so
+    /// its first start keeps the saved hostname and machine ID instead of
+    /// minting a new identity for a clone (`machine create --keep-identity`).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub keep_identity: bool,
+
     /// Stop the machine once its workload exits, whatever the exit status.
     /// The guest flushes storage as for `machine stop`, then powers off.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -823,6 +829,7 @@ impl VmRecord {
             cuda: false,
             forkable: false,
             detached: false,
+            keep_identity: false,
             stop_on_exit: false,
             cuda_fork_pool_size: None,
             cuda_vram_limit_mib: None,
@@ -907,6 +914,7 @@ impl VmRecord {
             cuda: false,
             forkable: false,
             detached: false,
+            keep_identity: false,
             stop_on_exit: false,
             cuda_fork_pool_size: None,
             cuda_vram_limit_mib: None,

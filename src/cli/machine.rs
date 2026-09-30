@@ -2700,6 +2700,30 @@ mod tests {
     }
 
     #[test]
+    fn create_accepts_keep_identity() {
+        let cli = TestMachineCli::try_parse_from([
+            "machine",
+            "create",
+            "--name",
+            "desk-2",
+            "--from",
+            "save.checkpoint",
+            "--keep-identity",
+        ])
+        .unwrap();
+        let MachineCmd::Create(cmd) = cli.command else {
+            panic!("expected machine create");
+        };
+        assert!(cmd.keep_identity);
+        let cli =
+            TestMachineCli::try_parse_from(["machine", "create", "--name", "desk-3"]).unwrap();
+        let MachineCmd::Create(cmd) = cli.command else {
+            panic!("expected machine create");
+        };
+        assert!(!cmd.keep_identity);
+    }
+
+    #[test]
     fn restore_cache_flags_bound_create_and_checkpoint_warm() {
         let parse = |argv: &[&str]| TestMachineCli::try_parse_from(argv).map(|cli| cli.command);
         let Ok(MachineCmd::Create(create)) =
@@ -3690,6 +3714,13 @@ pub struct CreateCmd {
     #[command(flatten)]
     pub restore_cache: super::pack::RestoreCacheArgs,
 
+    /// With `--from` a checkpoint: keep the hostname and machine ID it was
+    /// saved with instead of giving the new machine its own identity. For
+    /// rewinding a machine to an earlier save point, which skips about a second
+    /// of identity reset; do not run two machines from one checkpoint with it
+    #[arg(long)]
+    pub keep_identity: bool,
+
     /// Name for the machine (auto-generated if omitted)
     #[arg(short = 'n', long, value_name = "NAME", env = smolvm::data::consts::ENV_SMOLVM_MACHINE_NAME)]
     pub name: Option<String>,
@@ -4542,7 +4573,14 @@ impl CreateCmd {
         )?;
 
         let mut record = vm_common::build_vm_record_for(&params, checkpoint.is_some())?;
+        if self.keep_identity && checkpoint.is_none() {
+            return Err(smolvm::Error::config(
+                "create machine",
+                "--keep-identity needs --from a checkpoint",
+            ));
+        }
         if checkpoint.is_some() {
+            record.keep_identity = self.keep_identity;
             record.host_uid_owner = Some(record.name.clone());
             // The restored RAM already contains the initialized guest and its
             // running workload. Re-running image pull/init after resume would

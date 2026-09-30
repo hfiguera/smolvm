@@ -1844,6 +1844,10 @@ fn start_vm_named_with_db(
         );
     }
 
+    if restoring_checkpoint {
+        smolvm::portable_checkpoint::prefetch_restore_memory(&smolvm::agent::vm_data_dir(name));
+    }
+
     let _ = manager
         .ensure_running_with_full_config(mounts, ports, resources, features)
         .map_err(|e| Error::agent("start machine", e.to_string()))?;
@@ -1861,11 +1865,19 @@ fn start_vm_named_with_db(
     // before init runs — otherwise any init command referencing the
     // image's filesystem (package managers, distro-specific paths)
     // would hit the bare Alpine agent and fail with "not found".
+    let mut phase = std::time::Instant::now();
     let mut client = smolvm::agent::AgentClient::connect_with_retry(manager.vsock_socket())?;
+    smolvm::portable_checkpoint::log_phase(name, "start_agent_connect", &mut phase);
 
     if restoring_checkpoint {
         if let Err(error) = smolvm::portable_checkpoint::finalize_live_restore(name, &record)
-            .and_then(|()| smolvm::portable_checkpoint::consume(&smolvm::agent::vm_data_dir(name)))
+            .and_then(|()| {
+                smolvm::portable_checkpoint::log_phase(name, "restore_finalize", &mut phase);
+                smolvm::portable_checkpoint::consume(&smolvm::agent::vm_data_dir(name))
+            })
+            .inspect(|()| {
+                smolvm::portable_checkpoint::log_phase(name, "restore_consume", &mut phase)
+            })
         {
             let _ = manager.stop();
             return Err(error);

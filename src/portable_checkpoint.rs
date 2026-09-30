@@ -427,7 +427,40 @@ pub fn materialize_for_restore_at(
     Ok(())
 }
 
-pub(crate) fn log_phase(name: &str, phase: &str, started: &mut std::time::Instant) {
+/// Read a pending restore's RAM file into the page cache on a background
+/// thread. Restored guest RAM is mapped lazily, so the first commands after
+/// boot otherwise page it in from disk: about 0.6 s for a 2 GiB desktop, against
+/// 0.05 s once cached. Started before boot so the read overlaps it; best-effort,
+/// and a read cut short when the process exits only leaves pages to fault in.
+pub fn prefetch_restore_memory(vm_data_dir: &Path) {
+    let Some(dir) = pending_dir(vm_data_dir) else {
+        return;
+    };
+    let path = dir.join("memory.bin");
+    std::thread::spawn(move || {
+        use std::io::Read;
+        let started = std::time::Instant::now();
+        let Ok(mut file) = std::fs::File::open(&path) else {
+            return;
+        };
+        let mut buffer = vec![0u8; 8 << 20];
+        let mut bytes = 0u64;
+        while let Ok(read) = file.read(&mut buffer) {
+            if read == 0 {
+                break;
+            }
+            bytes += read as u64;
+        }
+        tracing::debug!(
+            bytes,
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "prefetched restore memory"
+        );
+    });
+}
+
+/// Log how long one checkpoint phase took and restart the clock for the next.
+pub fn log_phase(name: &str, phase: &str, started: &mut std::time::Instant) {
     tracing::info!(
         machine = name,
         phase,
@@ -4278,10 +4311,15 @@ pub fn discard_transport_pack(vm_data_dir: &Path) -> Result<()> {
 /// inherited crun container ID so later `machine exec` calls join the restored
 /// workload instead of silently creating a second container.
 pub fn finalize_live_restore(name: &str, record: &VmRecord) -> Result<()> {
-    if record.paused_checkpoint.is_none() {
+    let mut phase = std::time::Instant::now();
+    // A clone gets its own identity; a resumed or rewound machine keeps its own.
+    if record.paused_checkpoint.is_none() && !record.keep_identity {
         crate::agent::fork::rejuvenate_clone(name, record)?;
+        log_phase(name, "restore_rejuvenate", &mut phase);
     }
-    crate::agent::fork::release_forkpoint(name, &record.fork_env)
+    crate::agent::fork::release_forkpoint(name, &record.fork_env)?;
+    log_phase(name, "restore_release_forkpoint", &mut phase);
+    Ok(())
 }
 
 /// Prepare an explicit same-machine resume. The durable artifact stays intact
