@@ -295,7 +295,8 @@ static RESOLVERS: std::sync::LazyLock<
 
 #[cfg(unix)]
 fn ensure_resolver_server(machine: &str) -> Result<()> {
-    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
     use std::os::unix::net::UnixStream;
     let mut resolvers = RESOLVERS.lock().unwrap_or_else(|e| e.into_inner());
     if resolvers.contains_key(machine) {
@@ -322,6 +323,21 @@ fn ensure_resolver_server(machine: &str) -> Result<()> {
     }
     let listener = tokio::net::UnixListener::bind(&path)
         .map_err(|e| Error::config("credentials", format!("bind resolver socket: {e}")))?;
+    // The per-VM data directory is chowned to a dedicated UID when a root
+    // node starts the VM. On an API restart the new socket is created by root
+    // again, so give it back to that VM's UID before serving requests.
+    if unsafe { libc::geteuid() } == 0 {
+        let owner = std::fs::metadata(path.parent().expect("socket has a parent"))
+            .map_err(|e| Error::config("credentials", format!("stat resolver directory: {e}")))?;
+        let cpath = std::ffi::CString::new(path.as_os_str().as_bytes())
+            .map_err(|e| Error::config("credentials", format!("invalid resolver path: {e}")))?;
+        if unsafe { libc::lchown(cpath.as_ptr(), owner.uid(), owner.gid()) } != 0 {
+            return Err(Error::config(
+                "credentials",
+                format!("chown resolver socket: {}", std::io::Error::last_os_error()),
+            ));
+        }
+    }
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
         .map_err(|e| Error::config("credentials", format!("protect resolver socket: {e}")))?;
     let machine_name = machine.to_string();
@@ -641,6 +657,19 @@ mod tests {
         assert_eq!(resolver.resolve(&request).unwrap().as_str(), "new");
         forget_values(machine);
         assert!(resolver.resolve(&request).is_err());
+        supply_values(
+            machine,
+            [("github".into(), zeroize::Zeroizing::new("rebound".into()))].into(),
+        )
+        .unwrap();
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let socket = resolver_socket_path(machine);
+        let metadata = std::fs::metadata(&socket).unwrap();
+        let parent = std::fs::metadata(socket.parent().unwrap()).unwrap();
+        assert_eq!(metadata.uid(), parent.uid());
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
+        assert_eq!(resolver.resolve(&request).unwrap().as_str(), "rebound");
+        forget_values(machine);
     }
 
     #[test]
