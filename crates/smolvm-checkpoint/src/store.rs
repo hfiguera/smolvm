@@ -1464,12 +1464,17 @@ pub fn materialize_at(
 /// The cache owns only clones, never writable VM files. One stable root lock
 /// covers selection, cloning, publication and eviction across processes.
 /// Cache setup/publication failures degrade to ordinary restoration.
+///
+/// Retention is bounded by `max_entries` and by `max_bytes` of allocated
+/// space; the least recently used entries go first, and an entry larger than
+/// the whole budget is not kept.
 pub fn materialize_cached(
     directory: &Path,
     output: &Path,
     cache_root: &Path,
     legacy_base: Option<&Path>,
     max_entries: usize,
+    max_bytes: u64,
 ) -> io::Result<PackManifest> {
     if max_entries == 0 {
         return materialize_with_base(directory, output, legacy_base);
@@ -1567,9 +1572,23 @@ pub fn materialize_cached(
             tracing::warn!(%error, "restore cache recency update failed");
         }
         entries.retain(|(_, path)| *path != exact);
-        while entries.len() >= max_entries {
+        let kept = entry_bytes(&exact);
+        let mut total = kept
+            + entries
+                .iter()
+                .map(|(_, path)| entry_bytes(path))
+                .sum::<u64>();
+        while !entries.is_empty() && (entries.len() >= max_entries || total > max_bytes) {
             let (_, victim) = entries.remove(0);
+            total = total.saturating_sub(entry_bytes(&victim));
             if let Err(error) = remove_cache_entry(&victim) {
+                tracing::warn!(%error, "restore cache eviction failed");
+            }
+        }
+        // A checkpoint bigger than the whole budget would evict everything
+        // and still overrun it; restore it without retaining a copy.
+        if kept > max_bytes {
+            if let Err(error) = remove_cache_entry(&exact) {
                 tracing::warn!(%error, "restore cache eviction failed");
             }
         }
@@ -1582,6 +1601,38 @@ pub fn materialize_cached(
         "checkpoint restore cache"
     );
     Ok(manifest)
+}
+
+/// Space a cache entry holds: allocated blocks, so sparse RAM and disk files
+/// count only their data. Clones sharing blocks are counted in full, which
+/// errs toward evicting early rather than overrunning the budget.
+fn entry_bytes(path: &Path) -> u64 {
+    let mut total = 0;
+    let mut stack = vec![path.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let Ok(meta) = entry.metadata() else {
+                continue;
+            };
+            if meta.is_dir() {
+                stack.push(entry.path());
+            } else {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::MetadataExt;
+                    total += meta.blocks() * 512;
+                }
+                #[cfg(not(unix))]
+                {
+                    total += meta.len();
+                }
+            }
+        }
+    }
+    total
 }
 
 // Call only while holding the cache root's exclusive lock. No cache reader
@@ -2234,7 +2285,7 @@ mod tests {
         let key = |saved: &Path| digest(&serde_json::to_vec(&read_index(saved).unwrap()).unwrap());
         for (i, (saved, bytes)) in sources.iter().take(2).enumerate() {
             let output = root.path().join(format!("first-{i}"));
-            materialize_cached(saved, &output, &cache, None, 2).unwrap();
+            materialize_cached(saved, &output, &cache, None, 2, u64::MAX).unwrap();
             assert_eq!(
                 fs::read(output.join("checkpoint/memory.bin")).unwrap(),
                 *bytes
@@ -2250,7 +2301,7 @@ mod tests {
             let (saved, bytes) = &sources[i];
             fs::rename(saved.join("objects"), saved.join("objects-hidden")).unwrap();
             let output = root.path().join(format!("revisit-{i}-{}", rand_suffix()));
-            materialize_cached(saved, &output, &cache, None, 2).unwrap();
+            materialize_cached(saved, &output, &cache, None, 2, u64::MAX).unwrap();
             assert_eq!(
                 fs::read(output.join("checkpoint/memory.bin")).unwrap(),
                 *bytes
@@ -2258,17 +2309,79 @@ mod tests {
             fs::write(output.join("checkpoint/memory.bin"), b"guest modification").unwrap();
             fs::rename(saved.join("objects-hidden"), saved.join("objects")).unwrap();
         }
-        materialize_cached(&sources[2].0, &root.path().join("third"), &cache, None, 2).unwrap();
+        materialize_cached(
+            &sources[2].0,
+            &root.path().join("third"),
+            &cache,
+            None,
+            2,
+            u64::MAX,
+        )
+        .unwrap();
         assert!(cache.join(key(&sources[0].0)).exists());
         assert!(!cache.join(key(&sources[1].0)).exists());
         assert!(cache.join(key(&sources[2].0)).exists());
         // Eviction never invalidates a saved artifact.
         let output = root.path().join("evicted-again");
-        materialize_cached(&sources[1].0, &output, &cache, None, 2).unwrap();
+        materialize_cached(&sources[1].0, &output, &cache, None, 2, u64::MAX).unwrap();
         assert_eq!(
             fs::read(output.join("checkpoint/memory.bin")).unwrap(),
             sources[1].1
         );
+    }
+
+    #[test]
+    fn byte_budget_evicts_oldest_entries_and_skips_oversized_ones() {
+        let root = tempfile::tempdir().unwrap();
+        let objects = root.path().join("objects");
+        let cache = root.path().join("restore-cache");
+        let sources: Vec<_> = (0..2)
+            .map(|i| {
+                let saved = root.path().join(format!("saved-{i}"));
+                // Distinct non-zero bytes so each entry allocates real blocks.
+                let bytes: Vec<u8> = (0..CHUNK_SIZE * 2)
+                    .map(|n| (n as u8) ^ (i as u8 + 1))
+                    .collect();
+                capture(&objects, &saved, &bytes);
+                (saved, bytes)
+            })
+            .collect();
+        let key = |saved: &Path| digest(&serde_json::to_vec(&read_index(saved).unwrap()).unwrap());
+        materialize_cached(
+            &sources[0].0,
+            &root.path().join("a"),
+            &cache,
+            None,
+            3,
+            u64::MAX,
+        )
+        .unwrap();
+        let first = cache.join(key(&sources[0].0));
+        if !first.exists() {
+            assert!(std::env::var_os("SMOLVM_TEST_REQUIRE_REFLINK").is_none());
+            return;
+        }
+        // Room for one entry: the second restore evicts the first.
+        let one = entry_bytes(&first);
+        materialize_cached(
+            &sources[1].0,
+            &root.path().join("b"),
+            &cache,
+            None,
+            3,
+            one + one / 2,
+        )
+        .unwrap();
+        assert!(!first.exists());
+        assert!(cache.join(key(&sources[1].0)).exists());
+        // A budget below one entry keeps nothing, and the restore is still whole.
+        let output = root.path().join("c");
+        materialize_cached(&sources[0].0, &output, &cache, None, 3, 1).unwrap();
+        assert_eq!(
+            fs::read(output.join("checkpoint/memory.bin")).unwrap(),
+            sources[0].1
+        );
+        assert!(!cache.join(key(&sources[0].0)).exists());
     }
 
     fn rand_suffix() -> u128 {
@@ -2285,13 +2398,21 @@ mod tests {
         let cache = root.path().join("restore-cache");
         let bytes = vec![42; CHUNK_SIZE + 7];
         capture(&root.path().join("objects"), &saved, &bytes);
-        materialize_cached(&saved, &root.path().join("first"), &cache, None, 1).unwrap();
+        materialize_cached(
+            &saved,
+            &root.path().join("first"),
+            &cache,
+            None,
+            1,
+            u64::MAX,
+        )
+        .unwrap();
         let key = digest(&serde_json::to_vec(&read_index(&saved).unwrap()).unwrap());
         let memory = cache.join(key).join("checkpoint/memory.bin");
         if memory.exists() {
             fs::write(&memory, b"corrupt and truncated").unwrap();
             let output = root.path().join("repaired");
-            materialize_cached(&saved, &output, &cache, None, 1).unwrap();
+            materialize_cached(&saved, &output, &cache, None, 1, u64::MAX).unwrap();
             assert_eq!(
                 fs::read(output.join("checkpoint/memory.bin")).unwrap(),
                 bytes
@@ -2301,13 +2422,21 @@ mod tests {
         let unavailable = root.path().join("not-a-directory");
         fs::write(&unavailable, b"x").unwrap();
         let output = root.path().join("fallback");
-        materialize_cached(&saved, &output, &unavailable, None, 1).unwrap();
+        materialize_cached(&saved, &output, &unavailable, None, 1, u64::MAX).unwrap();
         assert_eq!(
             fs::read(output.join("checkpoint/memory.bin")).unwrap(),
             bytes
         );
         let disabled = root.path().join("disabled-cache");
-        materialize_cached(&saved, &root.path().join("disabled"), &disabled, None, 0).unwrap();
+        materialize_cached(
+            &saved,
+            &root.path().join("disabled"),
+            &disabled,
+            None,
+            0,
+            u64::MAX,
+        )
+        .unwrap();
         assert!(!disabled.exists());
     }
 
@@ -2330,7 +2459,7 @@ mod tests {
                 scope.spawn(move || {
                     for n in 0..3 {
                         let output = root.join(format!("out-{i}-{n}"));
-                        materialize_cached(saved, &output, cache, None, 1).unwrap();
+                        materialize_cached(saved, &output, cache, None, 1, u64::MAX).unwrap();
                         assert_eq!(
                             fs::read(output.join("checkpoint/memory.bin")).unwrap(),
                             *bytes

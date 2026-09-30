@@ -367,6 +367,9 @@ fn link_completed_memory(_: &Path, _: &Path) -> Result<bool> {
     Ok(false)
 }
 
+/// Default space the restore cache may hold (`SMOLVM_RESTORE_CACHE_MAX_BYTES`).
+const DEFAULT_RESTORE_CACHE_MAX_BYTES: u64 = 16 * 1024 * 1024 * 1024;
+
 /// Materialize a stored checkpoint for restore, diffing against the node's
 /// bounded cache of pristine checkpoint materializations. Exact revisits clone
 /// without rewriting RAM; misses diff against a recent checkpoint. Both the CLI
@@ -395,12 +398,19 @@ pub fn materialize_for_restore_at(
         .and_then(|value| value.parse::<usize>().ok())
         .unwrap_or(3)
         .min(64);
+    // Each entry holds a whole checkpoint's RAM and disks, so the count alone
+    // could keep tens of GiB for large machines.
+    let max_bytes = std::env::var("SMOLVM_RESTORE_CACHE_MAX_BYTES")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .unwrap_or(DEFAULT_RESTORE_CACHE_MAX_BYTES);
     crate::checkpoint_store::materialize_cached(
         artifact,
         cache_dir,
         &cache,
         Some(&base),
         max_entries,
+        max_bytes,
     )
     .map_err(|error| Error::agent("materialize checkpoint", error.to_string()))?;
     Ok(())
