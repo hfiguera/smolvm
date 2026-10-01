@@ -73,6 +73,29 @@ No VM required. Run via cargo:
 cargo test
 ```
 
+## HTTP deletion failure recovery (Linux and macOS)
+
+`test_api_delete_cleanup.py` starts a dedicated server with private state and
+real machines. Run as a non-root user so the host permission fault is effective:
+
+```bash
+SMOLVM_LIB_DIR=/path/to/lib SMOLVM_AGENT_ROOTFS=/path/to/agent-rootfs \
+  python3 tests/test_api_delete_cleanup.py /path/to/smolvm
+```
+
+On Linux, the user needs KVM access. On macOS, the binary must be signed with
+`smolvm.entitlements`; set `DYLD_LIBRARY_PATH` to the runtime library directory
+if needed. The test gives only its child server a temporary home on macOS,
+keeping the user's normal database and machines separate.
+
+Use matching runtime libraries, guest rootfs, and the usual disk templates beside
+the binary. The test checks HTTP errors, retained records after a server restart,
+suppression of automatic restart, explicit cleanup retry, and pool retirement
+retry. It restores permissions and cleans up its own machines in `finally`.
+Logs and JSON observations remain in the printed temporary directory. Add
+`--expect-bug` when testing the previous implementation to reproduce its false
+success and missing records. This test does not assert a total pool capacity limit.
+
 ---
 
 ## Benchmarks

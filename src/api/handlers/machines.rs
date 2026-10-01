@@ -4793,6 +4793,10 @@ pub async fn drain_machines(state: &Arc<ApiState>) -> bool {
 }
 
 /// Delete a machine.
+///
+/// If data-directory inspection or removal fails, returns an error and retains
+/// the machine record for a cleanup retry. Removal may have partially succeeded;
+/// the retained record does not imply the machine can still be started.
 #[utoipa::path(
     delete,
     path = "/api/v1/machines/{name}",
@@ -4839,8 +4843,8 @@ pub async fn delete_machine(
     delete_one(state, name).await.map(Json)
 }
 
-/// Delete a single machine (no cascade): stop it, remove it from the registry
-/// and database, and delete its data directory. Refuses if it is a fork base
+/// Delete a single machine (no cascade): stop it, delete its data directory,
+/// then remove it from the registry and database. Refuses if it is a fork base
 /// with live clones. Shared by [`delete_machine`] (once per golden, and once per
 /// clone during a cascade).
 pub(crate) async fn delete_one(
@@ -4854,6 +4858,47 @@ pub(crate) async fn delete_one(
         let _ = reply.send(result);
     })
     .await
+}
+
+// Called with the lifecycle and fork-source locks held, after confirmed shutdown.
+// Keep filesystem and database I/O on the blocking thread.
+fn remove_machine_data_and_record(
+    state: &ApiState,
+    name: &str,
+    data_dir: &std::path::Path,
+) -> Result<(), ApiError> {
+    match std::fs::symlink_metadata(data_dir) {
+        Ok(_) => {
+            // Shutdown was confirmed before entering this helper. Release the
+            // uid before removing its .vm-uid file, as in CLI deletion.
+            crate::process::free_vm_uid(&crate::agent::vm_uid_registry_dir(), data_dir);
+            std::fs::remove_dir_all(data_dir).map_err(|error| {
+                ApiError::internal(format!(
+                    "failed to remove data for machine '{name}': {error}; repair host storage and retry deletion"
+                ))
+            })?;
+        }
+        // Storage may already be gone after an interrupted delete or DB failure.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        // Path::exists would hide permission and I/O errors as absence.
+        Err(error) => {
+            return Err(ApiError::internal(format!(
+                "failed to inspect data for machine '{name}': {error}; retry deletion after resolving the error"
+            )));
+        }
+    }
+    match state.remove_machine(name) {
+        Ok(_) => Ok(()),
+        Err(ApiError::NotFound(_)) => {
+            // Startup recovery can leave a record without an in-memory entry.
+            let removed = state.db().remove_vm(name).map_err(ApiError::database)?;
+            if removed.is_none() {
+                return Err(ApiError::NotFound(format!("machine '{name}' not found")));
+            }
+            Ok(())
+        }
+        Err(error) => Err(error),
+    }
 }
 
 async fn delete_one_transaction(
@@ -4991,46 +5036,29 @@ async fn delete_one_transaction(
     // undeletable, and every retry hits the same wall. Releasing the disk images
     // first makes the delete self-financing — it frees far more than the record
     // removal needs, so cleanup still works on a full disk.
-    let data_dir = vm_data_dir(&name);
-    if data_dir.exists() {
-        // Release this VM's per-VM uid (if any) back to the allocator before the
-        // dir holding its `.vm-uid` record is removed, so a high-churn cloud node
-        // doesn't leak the uid range. A fork clone has no uid of its own (it
-        // shares its golden's). See process::free_vm_uid.
-        crate::process::free_vm_uid(&crate::agent::vm_uid_registry_dir(), &data_dir);
-        if let Err(e) = std::fs::remove_dir_all(&data_dir) {
-            tracing::warn!(error = %e, "failed to remove VM data directory: {}", data_dir.display());
-        }
-    }
-
-    // Remove from registry (in-memory + database) in a blocking task: the DB
-    // delete is synchronous disk I/O and must not run on an async worker thread,
-    // where it would starve the small per-node reactor under delete churn.
     let state_rm = state.clone();
     let name_rm = name.clone();
-    tokio::task::spawn_blocking(move || -> Result<(), ApiError> {
-        match state_rm.remove_machine(&name_rm) {
-            Ok(_) => Ok(()),
-            Err(ApiError::NotFound(_)) => {
-                // Machine exists in DB but not in registry (startup recovery case).
-                // Remove directly from DB.
-                let removed = state_rm
-                    .db()
-                    .remove_vm(&name_rm)
-                    .map_err(ApiError::database)?;
-                if removed.is_none() {
-                    return Err(ApiError::NotFound(format!(
-                        "machine '{}' not found",
-                        name_rm
-                    )));
-                }
-                Ok(())
-            }
-            Err(e) => Err(e),
-        }
+    let cleanup = tokio::task::spawn_blocking(move || {
+        remove_machine_data_and_record(&state_rm, &name_rm, &vm_data_dir(&name_rm))
     })
     .await
-    .map_err(|e| ApiError::internal(format!("task error: {}", e)))??;
+    .map_err(|e| ApiError::internal(format!("task error: {e}")))?;
+    if let Err(error) = cleanup {
+        // The process is confirmed dead, but its record must survive for retry.
+        // Clear its PID so startup recovery does not discard it as a crashed VM,
+        // and suppress automatic restarts over potentially half-removed disks.
+        if let Ok(entry) = state.get_machine(&name) {
+            entry.lock().restart.user_stopped = true;
+        }
+        reconcile_confirmed_stopped_machine(&state, &name, true)
+            .await
+            .map_err(|reconcile_error| {
+                ApiError::internal(format!(
+                    "cleanup failed: {error:?}; failed to persist stopped state: {reconcile_error:?}"
+                ))
+            })?;
+        return Err(error);
+    }
 
     if let Some(parent) = record.golden.clone() {
         let db = state.db().clone();
@@ -6357,6 +6385,60 @@ mod tests {
         let db = SmolvmDb::open_at(&db_path).expect("failed to open test db");
         let state = Arc::new(ApiState::with_db(db));
         (dir, state)
+    }
+
+    #[test]
+    fn delete_cleanup_failure_preserves_record_for_retry() {
+        let (dir, state) = setup_test_state();
+        let name = "cleanup-failure";
+        create_test_vm(state.db(), name, Some(20), Some(5));
+        let data_dir = dir.path().join("machine-data");
+        // A file instead of a directory fails even when tests run as root.
+        std::fs::write(&data_dir, b"not a directory").unwrap();
+
+        let error = remove_machine_data_and_record(&state, name, &data_dir).unwrap_err();
+        assert!(matches!(error, ApiError::Internal(_)));
+        assert!(state.db().get_vm(name).unwrap().is_some());
+        assert_eq!(std::fs::read(&data_dir).unwrap(), b"not a directory");
+
+        // Repair the host path and retry through fresh API state, as after restart.
+        std::fs::remove_file(&data_dir).unwrap();
+        std::fs::create_dir(&data_dir).unwrap();
+        std::fs::write(data_dir.join("storage.raw"), b"remaining disk").unwrap();
+        drop(state);
+        let db = SmolvmDb::open_at(&dir.path().join("test.db")).unwrap();
+        let recovered = ApiState::with_db(db);
+        remove_machine_data_and_record(&recovered, name, &data_dir).unwrap();
+        assert!(!data_dir.exists());
+        assert!(recovered.db().get_vm(name).unwrap().is_none());
+    }
+
+    #[test]
+    fn delete_cleanup_accepts_already_absent_data() {
+        let (dir, state) = setup_test_state();
+        let name = "cleanup-already-absent";
+        create_test_vm(state.db(), name, Some(20), Some(5));
+        // A previous attempt may have removed storage before its DB write failed.
+        let data_dir = dir.path().join("missing-parent/machine-data");
+        remove_machine_data_and_record(&state, name, &data_dir).unwrap();
+        assert!(state.db().get_vm(name).unwrap().is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn delete_cleanup_inspection_error_preserves_record() {
+        let (dir, state) = setup_test_state();
+        let name = "cleanup-inspection-error";
+        create_test_vm(state.db(), name, Some(20), Some(5));
+        // A symlink loop makes stat fail without relying on the caller's uid.
+        let loop_path = dir.path().join("loop");
+        std::os::unix::fs::symlink("loop", &loop_path).unwrap();
+        let data_dir = loop_path.join("machine-data");
+        assert!(matches!(
+            remove_machine_data_and_record(&state, name, &data_dir),
+            Err(ApiError::Internal(_))
+        ));
+        assert!(state.db().get_vm(name).unwrap().is_some());
     }
 
     #[tokio::test]
