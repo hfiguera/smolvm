@@ -109,8 +109,8 @@ pub(crate) fn cleanup_sandbox(id: &str, stop: bool) -> Result<(), String> {
     let rt = smolvm::embedded::runtime().map_err(|error| error.to_string())?;
     if let Some(budget) = budget.as_ref() {
         match budget.attempt(id)? {
-            Attempt::Unknown => return verify_sandbox_absent(rt, id, false),
-            Attempt::Retired => return verify_sandbox_absent(rt, id, true),
+            Attempt::Unknown => return verify_sandbox_absent(&rt, id, false),
+            Attempt::Retired => return verify_sandbox_absent(&rt, id, true),
             Attempt::Pending => {}
         }
     }
@@ -123,7 +123,7 @@ pub(crate) fn cleanup_sandbox(id: &str, stop: bool) -> Result<(), String> {
     rt.delete_machine(id)
         .map_err(|error| format!("delete sandbox VM: {error}"))?;
     if let Some(budget) = budget.as_mut() {
-        verify_vm_absent(rt, id)?;
+        verify_vm_absent(&rt, id)?;
         remove_sandbox_share(id).map_err(|error| format!("remove sandbox share {id}: {error}"))?;
         require_absent(&Path::new(POD_SHARE_HOST_ROOT).join(id))?;
         budget.retire()?;
@@ -734,7 +734,7 @@ impl PodBackend for EnginePodBackend {
                 budget
                     .admit(&id_owned, || {
                         let rt = smolvm::embedded::runtime().map_err(|error| error.to_string())?;
-                        verify_sandbox_absent(rt, &id_owned, false)
+                        verify_sandbox_absent(&rt, &id_owned, false)
                     })
                     .map_err(|error| format!("sandbox {id_owned}: {error}"))?;
             }
