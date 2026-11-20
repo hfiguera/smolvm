@@ -27,6 +27,8 @@ struct Register {
     admitted: Vec<String>,
     #[serde(deserialize_with = "Deserialize::deserialize")]
     pending: Option<String>,
+    #[serde(default)]
+    cleanup_requested: bool,
 }
 
 pub(crate) struct AttemptBudget {
@@ -36,7 +38,7 @@ pub(crate) struct AttemptBudget {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Attempt {
+enum Attempt {
     Unknown,
     Pending,
     Retired,
@@ -83,6 +85,7 @@ impl AttemptBudget {
             || register.admitted.len() > register.limit
             || unique.len() != register.admitted.len()
             || !register.admitted.iter().all(|id| valid_id(id))
+            || (register.cleanup_requested && register.pending.is_none())
             || register
                 .pending
                 .as_ref()
@@ -97,7 +100,7 @@ impl AttemptBudget {
         })
     }
 
-    pub(crate) fn attempt(&self, id: &str) -> Result<Attempt, String> {
+    fn attempt(&self, id: &str) -> Result<Attempt, String> {
         if !valid_id(id) {
             return Err("sandbox attempt budget requires a 64-digit lowercase hex ID".into());
         }
@@ -113,9 +116,12 @@ impl AttemptBudget {
     pub(crate) fn admit(
         &mut self,
         id: &str,
+        reap: impl FnOnce(&str) -> Result<(), String>,
         verify_unused: impl FnOnce() -> Result<(), String>,
     ) -> Result<(), String> {
-        if self.attempt(id)? != Attempt::Unknown {
+        let attempt = self.attempt(id)?;
+        self.retry_cleanup(reap)?;
+        if attempt != Attempt::Unknown {
             return Err("sandbox attempt was already admitted".into());
         }
         if self.register.admitted.len() == self.register.limit {
@@ -130,10 +136,43 @@ impl AttemptBudget {
         self.persist()
     }
 
-    /// Call only after the original VM and its share have been removed.
-    pub(crate) fn retire(&mut self) -> Result<(), String> {
-        self.register.pending = None;
-        self.persist()
+    pub(crate) fn cleanup(
+        &mut self,
+        id: &str,
+        verify_absent: impl FnOnce(bool) -> Result<(), String>,
+        reap: impl FnOnce(&str) -> Result<(), String>,
+    ) -> Result<(), String> {
+        match self.attempt(id)? {
+            Attempt::Unknown => return verify_absent(false),
+            Attempt::Retired => return verify_absent(true),
+            Attempt::Pending => {}
+        }
+
+        // Persist Delete's intent before touching the original VM. Later
+        // Creates can then resume cleanup without treating a live VM as stale.
+        if !self.register.cleanup_requested {
+            self.register.cleanup_requested = true;
+            self.persist()?;
+        }
+        self.retry_cleanup(reap)
+    }
+
+    fn retry_cleanup(
+        &mut self,
+        reap: impl FnOnce(&str) -> Result<(), String>,
+    ) -> Result<(), String> {
+        if let Some(id) = self
+            .register
+            .pending
+            .as_deref()
+            .filter(|_| self.register.cleanup_requested)
+        {
+            reap(id).map_err(|error| format!("cleanup of sandbox {id}: {error}"))?;
+            self.register.pending = None;
+            self.register.cleanup_requested = false;
+            self.persist()?;
+        }
+        Ok(())
     }
 
     fn persist(&self) -> Result<(), String> {
@@ -219,28 +258,45 @@ mod tests {
         let id = "a".repeat(64);
         AttemptBudget::open(directory.path())
             .unwrap()
-            .admit(&id, || Ok(()))
+            .admit(&id, |_| unreachable!(), || Ok(()))
             .unwrap();
         let mut restarted = AttemptBudget::open(directory.path()).unwrap();
         assert_eq!(restarted.attempt(&id).unwrap(), Attempt::Pending);
         assert_eq!(
-            restarted.admit(&id, || unreachable!()).unwrap_err(),
+            restarted
+                .admit(&id, |_| unreachable!(), || unreachable!())
+                .unwrap_err(),
             "sandbox attempt was already admitted"
         );
         let refused = "b".repeat(64);
         assert_eq!(
-            restarted.admit(&refused, || unreachable!()).unwrap_err(),
+            restarted
+                .admit(&refused, |_| unreachable!(), || unreachable!())
+                .unwrap_err(),
             "sandbox attempt budget exhausted"
         );
         assert_eq!(restarted.attempt(&refused).unwrap(), Attempt::Unknown);
-        restarted.retire().unwrap();
+        assert!(restarted
+            .cleanup(&id, |_| unreachable!(), |_| Err("temporary failure".into()))
+            .is_err());
         drop(restarted);
         let mut restarted = AttemptBudget::open(directory.path()).unwrap();
-        assert_eq!(restarted.attempt(&id).unwrap(), Attempt::Retired);
+        assert_eq!(restarted.attempt(&id).unwrap(), Attempt::Pending);
         assert_eq!(
-            restarted.admit(&refused, || unreachable!()).unwrap_err(),
+            restarted
+                .admit(
+                    &refused,
+                    |original| {
+                        assert_eq!(original, id);
+                        Ok(())
+                    },
+                    || unreachable!(),
+                )
+                .unwrap_err(),
             "sandbox attempt budget exhausted"
         );
+        assert_eq!(restarted.attempt(&id).unwrap(), Attempt::Retired);
+        assert_eq!(restarted.register.admitted, [id]);
     }
 
     #[test]
@@ -252,9 +308,11 @@ mod tests {
             let start = start.clone();
             thread::spawn(move || {
                 start.wait();
-                AttemptBudget::open(&path)
-                    .unwrap()
-                    .admit(&prefix.repeat(64), || Ok(()))
+                AttemptBudget::open(&path).unwrap().admit(
+                    &prefix.repeat(64),
+                    |_| unreachable!(),
+                    || Ok(()),
+                )
             })
         });
         let outcomes = writers.map(|writer| writer.join().unwrap());
@@ -274,5 +332,78 @@ mod tests {
         fs::remove_file(&path).unwrap();
         assert!(AttemptBudget::open(directory.path()).is_err());
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn interrupted_cleanup_is_retried_before_next_admission() {
+        let directory = fixture(2);
+        let original = "a".repeat(64);
+        let next = "b".repeat(64);
+        let mut budget = AttemptBudget::open(directory.path()).unwrap();
+        budget
+            .admit(&original, |_| unreachable!(), || Ok(()))
+            .unwrap();
+        budget
+            .cleanup(
+                &next,
+                |allow_lock| {
+                    assert!(!allow_lock);
+                    Ok(())
+                },
+                |_| unreachable!(),
+            )
+            .unwrap();
+        assert_eq!(
+            budget
+                .admit(&next, |_| unreachable!(), || unreachable!())
+                .unwrap_err(),
+            "previous sandbox attempt still requires cleanup"
+        );
+        let temporary_error = format!("cleanup of sandbox {original}: temporary cleanup failure");
+        assert_eq!(
+            budget
+                .cleanup(
+                    &original,
+                    |_| unreachable!(),
+                    |id| {
+                        assert_eq!(id, original);
+                        Err("temporary cleanup failure".into())
+                    },
+                )
+                .unwrap_err(),
+            temporary_error
+        );
+        drop(budget);
+
+        let mut reopened = AttemptBudget::open(directory.path()).unwrap();
+        assert_eq!(
+            reopened
+                .admit(
+                    &next,
+                    |id| {
+                        assert_eq!(id, original);
+                        Err("temporary cleanup failure".into())
+                    },
+                    || unreachable!(),
+                )
+                .unwrap_err(),
+            temporary_error
+        );
+        drop(reopened);
+
+        let mut reopened = AttemptBudget::open(directory.path()).unwrap();
+        reopened
+            .admit(
+                &next,
+                |id| {
+                    assert_eq!(id, original);
+                    Ok(())
+                },
+                || Ok(()),
+            )
+            .expect("recover the original cleanup and admit the replacement");
+        assert_eq!(reopened.register.admitted, [original.clone(), next.clone()]);
+        assert_eq!(reopened.attempt(&original).unwrap(), Attempt::Retired);
+        assert_eq!(reopened.attempt(&next).unwrap(), Attempt::Pending);
     }
 }

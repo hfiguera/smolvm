@@ -37,7 +37,7 @@ use smolvm::embedded::{EmbeddedRuntime, MachineSpec};
 use smolvm::network::NetworkBackend;
 use smolvm_protocol::{AgentRequest, AgentResponse};
 
-use crate::attempt_budget::{Attempt, AttemptBudget};
+use crate::attempt_budget::AttemptBudget;
 use crate::backend::{ExitInfo, ExitWatch, PodBackend, ProcessSpec, Stdio};
 
 /// Nominal guest target recorded on the sandbox's single [`HostMount`]
@@ -104,30 +104,39 @@ fn verify_sandbox_absent(rt: &EmbeddedRuntime, id: &str, allow_lock: bool) -> Re
     require_absent(&Path::new(POD_SHARE_HOST_ROOT).join(id))
 }
 
-pub(crate) fn cleanup_sandbox(id: &str, stop: bool) -> Result<(), String> {
-    let mut budget = AttemptBudget::configured()?;
-    let rt = smolvm::embedded::runtime().map_err(|error| error.to_string())?;
-    if let Some(budget) = budget.as_ref() {
-        match budget.attempt(id)? {
-            Attempt::Unknown => return verify_sandbox_absent(&rt, id, false),
-            Attempt::Retired => return verify_sandbox_absent(&rt, id, true),
-            Attempt::Pending => {}
-        }
-    }
-
+fn delete_sandbox_vm(rt: &EmbeddedRuntime, id: &str, stop: bool) -> Result<(), String> {
     if stop {
         if let Err(error) = rt.stop_machine(id) {
             warn!("stop sandbox VM {id}: {error}");
         }
     }
     rt.delete_machine(id)
-        .map_err(|error| format!("delete sandbox VM: {error}"))?;
-    if let Some(budget) = budget.as_mut() {
-        verify_vm_absent(&rt, id)?;
-        remove_sandbox_share(id).map_err(|error| format!("remove sandbox share {id}: {error}"))?;
-        require_absent(&Path::new(POD_SHARE_HOST_ROOT).join(id))?;
-        budget.retire()?;
-    } else if let Err(error) = remove_sandbox_share(id) {
+        .map_err(|error| format!("delete sandbox VM: {error}"))
+}
+
+fn reap_guarded_sandbox(id: &str, stop: bool) -> Result<(), String> {
+    let rt = smolvm::embedded::runtime().map_err(|error| error.to_string())?;
+    delete_sandbox_vm(&rt, id, stop)?;
+    verify_vm_absent(&rt, id)?;
+    remove_sandbox_share(id).map_err(|error| format!("remove sandbox share {id}: {error}"))?;
+    require_absent(&Path::new(POD_SHARE_HOST_ROOT).join(id))
+}
+
+pub(crate) fn cleanup_sandbox(id: &str, stop: bool) -> Result<(), String> {
+    if let Some(mut budget) = AttemptBudget::configured()? {
+        return budget.cleanup(
+            id,
+            |allow_lock| {
+                let rt = smolvm::embedded::runtime().map_err(|error| error.to_string())?;
+                verify_sandbox_absent(&rt, id, allow_lock)
+            },
+            |original| reap_guarded_sandbox(original, stop),
+        );
+    }
+
+    let rt = smolvm::embedded::runtime().map_err(|error| error.to_string())?;
+    delete_sandbox_vm(&rt, id, stop)?;
+    if let Err(error) = remove_sandbox_share(id) {
         warn!("remove sandbox share {id}: {error}");
     }
     Ok(())
@@ -732,10 +741,15 @@ impl PodBackend for EnginePodBackend {
             let mut budget = AttemptBudget::configured()?;
             if let Some(budget) = budget.as_mut() {
                 budget
-                    .admit(&id_owned, || {
-                        let rt = smolvm::embedded::runtime().map_err(|error| error.to_string())?;
-                        verify_sandbox_absent(&rt, &id_owned, false)
-                    })
+                    .admit(
+                        &id_owned,
+                        |original| reap_guarded_sandbox(original, false),
+                        || {
+                            let rt =
+                                smolvm::embedded::runtime().map_err(|error| error.to_string())?;
+                            verify_sandbox_absent(&rt, &id_owned, false)
+                        },
+                    )
                     .map_err(|error| format!("sandbox {id_owned}: {error}"))?;
             }
 

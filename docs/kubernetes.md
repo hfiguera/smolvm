@@ -34,6 +34,11 @@ limit, and spent attempts stay charged after cleanup and across restarts.
 Containerd continues to report failed Pod sandbox creation when the limit has
 been reached.
 
+The shim records the original sandbox's Delete request before cleanup. If
+cleanup fails, the next sandbox Create retries that cleanup before evaluating
+its own admission. A running sandbox holds the slot until its requested
+cleanup succeeds.
+
 To provision a new register, run as the account that runs containerd:
 
 ```sh
