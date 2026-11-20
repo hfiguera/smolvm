@@ -21,6 +21,7 @@
 //! `tokio::task::spawn_blocking`.
 
 use std::collections::HashMap;
+use std::fs::File;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -37,7 +38,7 @@ use smolvm::embedded::{EmbeddedRuntime, MachineSpec};
 use smolvm::network::NetworkBackend;
 use smolvm_protocol::{AgentRequest, AgentResponse};
 
-use crate::attempt_budget::AttemptBudget;
+use crate::attempt_budget::{AttemptBudget, DIRECTORY_ENV};
 use crate::backend::{ExitInfo, ExitWatch, PodBackend, ProcessSpec, Stdio};
 
 /// Nominal guest target recorded on the sandbox's single [`HostMount`]
@@ -245,6 +246,8 @@ enum PumpCmd {
 struct Sandbox {
     /// Sandbox task id == machine name.
     id: String,
+    /// Holds guarded admission through Create and the life of the shim task.
+    attempt_owner: Option<File>,
     /// Host dir shared into the guest (`<bundle>/podshare`).
     share_dir: PathBuf,
     /// Host-side unix socket bridging to the guest agent's vsock port.
@@ -295,15 +298,18 @@ impl EnginePodBackend {
         // or a shim crash (dead process, but the persistent record + disk images
         // survive). containerd can't drive this cleanup after a reboot — its task
         // state in /run is gone, so it never asks us to delete those sandboxes.
+        // Guarded workers recover the exact admitted ID under the register lock.
         static RECONCILED: std::sync::Once = std::sync::Once::new();
-        RECONCILED.call_once(|| match smolvm::embedded::runtime() {
-            Ok(rt) => match rt.reconcile_runtime_machines() {
-                Ok(n) if n > 0 => log::info!("reclaimed {n} stale sandbox VM(s) at startup"),
-                Ok(_) => {}
-                Err(e) => log::warn!("startup sandbox reconcile failed: {e}"),
-            },
-            Err(e) => log::warn!("startup sandbox reconcile: runtime unavailable: {e}"),
-        });
+        if std::env::var_os(DIRECTORY_ENV).is_none() {
+            RECONCILED.call_once(|| match smolvm::embedded::runtime() {
+                Ok(rt) => match rt.reconcile_runtime_machines() {
+                    Ok(n) if n > 0 => log::info!("reclaimed {n} stale sandbox VM(s) at startup"),
+                    Ok(_) => {}
+                    Err(e) => log::warn!("startup sandbox reconcile failed: {e}"),
+                },
+                Err(e) => log::warn!("startup sandbox reconcile: runtime unavailable: {e}"),
+            });
+        }
         Self {
             sandbox: Mutex::new(None),
             procs: Mutex::new(HashMap::new()),
@@ -739,9 +745,10 @@ impl PodBackend for EnginePodBackend {
             // Hold the register lock through create/start so the separate binary
             // Delete cannot retire this admission while its VM is still starting.
             let mut budget = AttemptBudget::configured()?;
-            if let Some(budget) = budget.as_mut() {
-                budget
-                    .admit(
+            let attempt_owner = budget
+                .as_mut()
+                .map(|budget| {
+                    budget.admit(
                         &id_owned,
                         |original| reap_guarded_sandbox(original, false),
                         || {
@@ -750,8 +757,9 @@ impl PodBackend for EnginePodBackend {
                             verify_sandbox_absent(&rt, &id_owned, false)
                         },
                     )
-                    .map_err(|error| format!("sandbox {id_owned}: {error}"))?;
-            }
+                })
+                .transpose()
+                .map_err(|error| format!("sandbox {id_owned}: {error}"))?;
 
             // The bundle lives under /run/containerd/... which the engine's mount
             // validation rejects as a protected system path. Host the pod share
@@ -835,6 +843,7 @@ impl PodBackend for EnginePodBackend {
             Ok::<_, String>((
                 Sandbox {
                     id: id_owned,
+                    attempt_owner,
                     share_dir,
                     socket,
                     netns,
@@ -1092,9 +1101,14 @@ impl PodBackend for EnginePodBackend {
         if self.is_sandbox_task(id, exec_id) {
             // Sandbox delete = tear down the whole VM.
             let sandbox = self.sandbox()?;
-            tokio::task::spawn_blocking(move || cleanup_sandbox(&sandbox.id, true))
-                .await
-                .map_err(|e| e.to_string())??;
+            tokio::task::spawn_blocking(move || {
+                if let Some(owner) = &sandbox.attempt_owner {
+                    owner.unlock().map_err(|error| error.to_string())?;
+                }
+                cleanup_sandbox(&sandbox.id, true)
+            })
+            .await
+            .map_err(|e| e.to_string())??;
             *self.sandbox.lock().map_err(|e| e.to_string())? = None;
             self.procs.lock().map_err(|e| e.to_string())?.remove(&k);
             return Ok(());

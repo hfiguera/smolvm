@@ -36,8 +36,11 @@ been reached.
 
 The shim records the original sandbox's Delete request before cleanup. If
 cleanup fails, the next sandbox Create retries that cleanup before evaluating
-its own admission. A running sandbox holds the slot until its requested
-cleanup succeeds.
+its own admission. The shim holds an owner lock through Create and while the
+task is active. If the owner exits or Create fails, the next Create can use
+that lock to recover the original attempt even if the Delete request could
+not be recorded. Attempts already pending when upgrading from a register
+without ownership require a Delete for the original ID.
 
 To provision a new register, run as the account that runs containerd:
 
@@ -55,8 +58,9 @@ containerd service environment, or in the K3s service when it runs containerd.
 All shim processes must inherit the same setting. Use local storage outside
 the VM and Pod share roots. The example limit of two is useful for testing.
 Choose a limit from 1 to 2,048 based on the worker's storage and inventory
-budget. Retain the directory and original lock inode for the life of the
-worker. Start with a freshly provisioned worker when renewing the budget.
+budget. Retain the directory and original lock inodes for the life of the
+worker, including `sandbox-owner`, which the shim creates on first admission.
+Start with a freshly provisioned worker when renewing the budget.
 
 ## Shim child-process ownership
 

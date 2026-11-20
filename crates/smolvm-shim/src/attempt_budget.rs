@@ -5,7 +5,7 @@
 //! same lock. The lock file is never replaced.
 
 use std::collections::BTreeSet;
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File, OpenOptions, TryLockError};
 use std::io::{self, Read, Write};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
@@ -16,6 +16,7 @@ use serde::{Deserialize, Serialize};
 pub(crate) const DIRECTORY_ENV: &str = "SMOLVM_SANDBOX_ATTEMPT_BUDGET_DIR";
 const REGISTER: &str = "attempts.json";
 const NEXT_REGISTER: &str = ".attempts.json.next";
+const OWNER_LOCK: &str = "sandbox-owner";
 const MAX_ATTEMPTS: usize = 2048;
 const MAX_REGISTER_BYTES: u64 = 256 * 1024;
 
@@ -29,10 +30,30 @@ struct Register {
     pending: Option<String>,
     #[serde(default)]
     cleanup_requested: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    owner: Option<OwnerIdentity>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct OwnerIdentity {
+    device: u64,
+    inode: u64,
+}
+
+impl OwnerIdentity {
+    fn of(file: &File) -> io::Result<Self> {
+        let metadata = file.metadata()?;
+        Ok(Self {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        })
+    }
 }
 
 pub(crate) struct AttemptBudget {
     directory: PathBuf,
+    uid: u32,
     _lock: File,
     register: Register,
 }
@@ -85,7 +106,8 @@ impl AttemptBudget {
             || register.admitted.len() > register.limit
             || unique.len() != register.admitted.len()
             || !register.admitted.iter().all(|id| valid_id(id))
-            || (register.cleanup_requested && register.pending.is_none())
+            || ((register.cleanup_requested || register.owner.is_some())
+                && register.pending.is_none())
             || register
                 .pending
                 .as_ref()
@@ -95,6 +117,7 @@ impl AttemptBudget {
         }
         Ok(Self {
             directory: directory.into(),
+            uid: owner,
             _lock: lock,
             register,
         })
@@ -118,7 +141,7 @@ impl AttemptBudget {
         id: &str,
         reap: impl FnOnce(&str) -> Result<(), String>,
         verify_unused: impl FnOnce() -> Result<(), String>,
-    ) -> Result<(), String> {
+    ) -> Result<File, String> {
         let attempt = self.attempt(id)?;
         self.retry_cleanup(reap)?;
         if attempt != Attempt::Unknown {
@@ -131,9 +154,14 @@ impl AttemptBudget {
             return Err("previous sandbox attempt still requires cleanup".into());
         }
         verify_unused()?;
+        let owner = self
+            .try_lock_owner(None)?
+            .ok_or("previous sandbox owner still holds its lock")?;
+        self.register.owner = Some(OwnerIdentity::of(&owner).map_err(|error| error.to_string())?);
         self.register.admitted.push(id.into());
         self.register.pending = Some(id.into());
-        self.persist()
+        self.persist()?;
+        Ok(owner)
     }
 
     pub(crate) fn cleanup(
@@ -161,18 +189,59 @@ impl AttemptBudget {
         &mut self,
         reap: impl FnOnce(&str) -> Result<(), String>,
     ) -> Result<(), String> {
-        if let Some(id) = self
-            .register
-            .pending
-            .as_deref()
-            .filter(|_| self.register.cleanup_requested)
-        {
-            reap(id).map_err(|error| format!("cleanup of sandbox {id}: {error}"))?;
-            self.register.pending = None;
-            self.register.cleanup_requested = false;
-            self.persist()?;
+        let Some(id) = self.register.pending.as_deref() else {
+            return Ok(());
+        };
+        let _abandoned_owner = if self.register.cleanup_requested {
+            None
+        } else {
+            // Failed Create or shim exit releases this lock. Keep it until
+            // cleanup commits. Legacy attempts need an explicit Delete.
+            let Some(expected) = self.register.owner else {
+                return Ok(());
+            };
+            let Some(owner) = self.try_lock_owner(Some(expected))? else {
+                return Ok(());
+            };
+            Some(owner)
+        };
+        reap(id).map_err(|error| format!("cleanup of sandbox {id}: {error}"))?;
+        self.register.pending = None;
+        self.register.cleanup_requested = false;
+        self.register.owner = None;
+        self.persist()
+    }
+
+    fn try_lock_owner(&self, expected: Option<OwnerIdentity>) -> Result<Option<File>, String> {
+        let path = self.directory.join(OWNER_LOCK);
+        let file = match open_private(&path, self.uid) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound && expected.is_none() => {
+                // The register lock serializes creation of this fixed inode.
+                OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .create_new(true)
+                    .mode(0o600)
+                    .open(path)
+                    .and_then(|file| {
+                        file.sync_all()?;
+                        Ok(file)
+                    })
+            }
+            result => result,
         }
-        Ok(())
+        .map_err(|error| format!("open sandbox owner lock: {error}"))?;
+        if let Some(expected) = expected {
+            let actual = OwnerIdentity::of(&file).map_err(|error| error.to_string())?;
+            if actual != expected {
+                return Err("sandbox owner lock identity changed".into());
+            }
+        }
+        match file.try_lock() {
+            Ok(()) => Ok(Some(file)),
+            Err(TryLockError::WouldBlock) => Ok(None),
+            Err(TryLockError::Error(error)) => Err(format!("lock sandbox owner: {error}")),
+        }
     }
 
     fn persist(&self) -> Result<(), String> {
@@ -256,7 +325,7 @@ mod tests {
     fn lost_ack_and_cleanup_keep_the_debit() {
         let directory = fixture(1);
         let id = "a".repeat(64);
-        AttemptBudget::open(directory.path())
+        let _owner = AttemptBudget::open(directory.path())
             .unwrap()
             .admit(&id, |_| unreachable!(), || Ok(()))
             .unwrap();
@@ -340,7 +409,7 @@ mod tests {
         let original = "a".repeat(64);
         let next = "b".repeat(64);
         let mut budget = AttemptBudget::open(directory.path()).unwrap();
-        budget
+        let owner = budget
             .admit(&original, |_| unreachable!(), || Ok(()))
             .unwrap();
         budget
@@ -390,6 +459,7 @@ mod tests {
             temporary_error
         );
         drop(reopened);
+        drop(owner);
 
         let mut reopened = AttemptBudget::open(directory.path()).unwrap();
         reopened
@@ -405,5 +475,107 @@ mod tests {
         assert_eq!(reopened.register.admitted, [original.clone(), next.clone()]);
         assert_eq!(reopened.attempt(&original).unwrap(), Attempt::Retired);
         assert_eq!(reopened.attempt(&next).unwrap(), Attempt::Pending);
+    }
+
+    #[test]
+    fn cleanup_recovers_after_its_register_update_fails() {
+        let directory = fixture(2);
+        let original = "a".repeat(64);
+        let next = "b".repeat(64);
+        let mut budget = AttemptBudget::open(directory.path()).unwrap();
+        let owner = budget
+            .admit(&original, |_| unreachable!(), || Ok(()))
+            .unwrap();
+
+        let blocked_update = directory.path().join(NEXT_REGISTER);
+        fs::create_dir(&blocked_update).unwrap();
+        let error = budget
+            .cleanup(&original, |_| unreachable!(), |_| unreachable!())
+            .unwrap_err();
+        assert!(error.starts_with("commit sandbox attempt register:"));
+        drop(budget);
+        fs::remove_dir(blocked_update).unwrap();
+
+        let mut reopened = AttemptBudget::open(directory.path()).unwrap();
+        assert!(!reopened.register.cleanup_requested);
+        assert_eq!(
+            reopened
+                .admit(&next, |_| unreachable!(), || unreachable!())
+                .unwrap_err(),
+            "previous sandbox attempt still requires cleanup"
+        );
+        drop(owner);
+        reopened
+            .admit(
+                &next,
+                |id| {
+                    assert_eq!(id, original);
+                    Ok(())
+                },
+                || Ok(()),
+            )
+            .expect("recover the original cleanup after the register write failure");
+        assert_eq!(reopened.attempt(&original).unwrap(), Attempt::Retired);
+        assert_eq!(reopened.register.admitted, [original, next]);
+    }
+
+    #[test]
+    fn replaced_owner_lock_is_not_evidence_of_abandonment() {
+        let directory = fixture(2);
+        let original = "a".repeat(64);
+        let next = "b".repeat(64);
+        let mut budget = AttemptBudget::open(directory.path()).unwrap();
+        let _owner = budget
+            .admit(&original, |_| unreachable!(), || Ok(()))
+            .unwrap();
+
+        let path = directory.path().join(OWNER_LOCK);
+        fs::rename(&path, directory.path().join("original-owner")).unwrap();
+        OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(path)
+            .unwrap();
+        assert_eq!(
+            budget
+                .admit(&next, |_| unreachable!(), || unreachable!())
+                .unwrap_err(),
+            "sandbox owner lock identity changed"
+        );
+        assert_eq!(budget.register.admitted, [original]);
+    }
+
+    #[test]
+    fn legacy_pending_attempt_requires_the_original_delete() {
+        let directory = fixture(2);
+        let original = "a".repeat(64);
+        let next = "b".repeat(64);
+        fs::write(
+            directory.path().join(REGISTER),
+            format!(
+                r#"{{"version":1,"limit":2,"admitted":["{original}"],"pending":"{original}"}}"#
+            ),
+        )
+        .unwrap();
+        let mut budget = AttemptBudget::open(directory.path()).unwrap();
+        assert_eq!(
+            budget
+                .admit(&next, |_| unreachable!(), || unreachable!())
+                .unwrap_err(),
+            "previous sandbox attempt still requires cleanup"
+        );
+        budget
+            .cleanup(
+                &original,
+                |_| unreachable!(),
+                |id| {
+                    assert_eq!(id, original);
+                    Ok(())
+                },
+            )
+            .unwrap();
+        let _next_owner = budget.admit(&next, |_| unreachable!(), || Ok(())).unwrap();
+        assert_eq!(budget.register.admitted, [original, next]);
     }
 }
