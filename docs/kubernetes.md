@@ -25,6 +25,34 @@ kubectl logs smolvm-hello    # prints the guest's own kernel, so it is a real VM
 
 Any pod opts in with `runtimeClassName: smolvm`.
 
+## Sandbox attempt limit for a dedicated worker
+
+On a fresh worker with a single SmolVM sandbox slot, an administrator can
+configure a lifetime limit on sandbox attempts. Each admitted sandbox ID spends
+one attempt before the shim creates any per-ID files. Cleanup can run at the
+limit, and spent attempts stay charged after cleanup and across restarts.
+Containerd continues to report failed Pod sandbox creation when the limit has
+been reached.
+
+To provision a new register, run as the account that runs containerd:
+
+```sh
+set -eu
+umask 077
+budget=/var/lib/smolvm-sandbox-attempt-budget
+mkdir -m 0700 "$budget"
+: > "$budget/lock"
+printf '%s\n' '{"version":1,"limit":2,"admitted":[],"pending":null}' > "$budget/attempts.json"
+```
+
+Set `SMOLVM_SANDBOX_ATTEMPT_BUDGET_DIR` to that absolute directory in the
+containerd service environment, or in the K3s service when it runs containerd.
+All shim processes must inherit the same setting. Use local storage outside
+the VM and Pod share roots. The example limit of two is useful for testing.
+Choose a limit from 1 to 2,048 based on the worker's storage and inventory
+budget. Retain the directory and original lock inode for the life of the
+worker. Start with a freshly provisioned worker when renewing the budget.
+
 ## Shim child-process ownership
 
 The embedded engine waits for foreground helpers such as `cp`, `chmod` and

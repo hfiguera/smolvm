@@ -150,7 +150,8 @@ pub(crate) fn inherit_operation_locks(
     inherited_lock::configure(command, locks.iter().map(|lock| &lock._file))
 }
 
-fn fork_source_lock_path(source: &str) -> PathBuf {
+/// Path of the machine's fork/lifecycle lock, without opening or creating it.
+pub fn fork_source_lock_path(source: &str) -> PathBuf {
     let data_dir = vm_data_dir(source);
     data_dir
         .parent()

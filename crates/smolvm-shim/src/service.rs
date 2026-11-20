@@ -11,8 +11,9 @@ use containerd_shim::{Config, Error, Flags, StartOpts};
 use containerd_shim_protos::api::DeleteResponse;
 use log::warn;
 
+use crate::attempt_budget::DIRECTORY_ENV;
 use crate::backend::MockBackend;
-use crate::engine::{remove_sandbox_share, EnginePodBackend, ShimBackend};
+use crate::engine::{cleanup_sandbox, EnginePodBackend, ShimBackend};
 use crate::task::TaskService;
 
 pub const RUNTIME_ID: &str = "io.containerd.smolvm.v2";
@@ -61,18 +62,16 @@ impl Shim for Service {
         // Best-effort — a missing machine (a container-task delete, or a VM
         // already cleaned by the graceful path) is not an error.
         let id = self.id.clone();
-        let _ = tokio::task::spawn_blocking(move || match smolvm::embedded::runtime() {
-            Ok(rt) => match rt.delete_machine(&id) {
-                Ok(()) => {
-                    if let Err(e) = remove_sandbox_share(&id) {
-                        warn!("delete_shim: reaping share {id} failed: {e}");
-                    }
-                }
-                Err(e) => warn!("delete_shim: reaping VM {id} failed: {e}"),
-            },
-            Err(e) => warn!("delete_shim: runtime unavailable, cannot reap VM {id}: {e}"),
-        })
-        .await;
+        let reaped = tokio::task::spawn_blocking(move || cleanup_sandbox(&id, false))
+            .await
+            .map_err(|error| error.to_string())
+            .and_then(|result| result);
+        if let Err(error) = reaped {
+            if std::env::var_os(DIRECTORY_ENV).is_some() {
+                return Err(Error::Other(error));
+            }
+            warn!("delete_shim: reaping {} failed: {error}", self.id);
+        }
         Ok(DeleteResponse {
             exit_status: 137,
             exited_at: Some(timestamp()?).into(),

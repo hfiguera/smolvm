@@ -4,6 +4,8 @@
 //! other platforms so workspace checks pass everywhere.
 
 #[cfg(target_os = "linux")]
+mod attempt_budget;
+#[cfg(target_os = "linux")]
 mod backend;
 #[cfg(target_os = "linux")]
 mod bundle;

@@ -33,10 +33,11 @@ use log::{debug, info, warn};
 use tokio::sync::watch;
 
 use smolvm::agent::{AgentClient, HostMount, VmResources};
-use smolvm::embedded::MachineSpec;
+use smolvm::embedded::{EmbeddedRuntime, MachineSpec};
 use smolvm::network::NetworkBackend;
 use smolvm_protocol::{AgentRequest, AgentResponse};
 
+use crate::attempt_budget::{Attempt, AttemptBudget};
 use crate::backend::{ExitInfo, ExitWatch, PodBackend, ProcessSpec, Stdio};
 
 /// Nominal guest target recorded on the sandbox's single [`HostMount`]
@@ -72,8 +73,64 @@ fn remove_sandbox_share_at(root: &Path, id: &str) -> std::io::Result<()> {
     }
 }
 
-pub(crate) fn remove_sandbox_share(id: &str) -> std::io::Result<()> {
+fn remove_sandbox_share(id: &str) -> std::io::Result<()> {
     remove_sandbox_share_at(Path::new(POD_SHARE_HOST_ROOT), id)
+}
+
+fn require_absent(path: &Path) -> Result<(), String> {
+    match path.symlink_metadata() {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!("inspect {}: {error}", path.display())),
+        Ok(_) => Err(format!("sandbox path still exists: {}", path.display())),
+    }
+}
+
+fn verify_vm_absent(rt: &EmbeddedRuntime, id: &str) -> Result<(), String> {
+    if rt
+        .machine_record(id)
+        .map_err(|error| error.to_string())?
+        .is_some()
+    {
+        return Err(format!("sandbox {id} still has a VM record"));
+    }
+    require_absent(&smolvm::agent::vm_data_dir(id))
+}
+
+fn verify_sandbox_absent(rt: &EmbeddedRuntime, id: &str, allow_lock: bool) -> Result<(), String> {
+    verify_vm_absent(rt, id)?;
+    if !allow_lock {
+        require_absent(&smolvm::agent::fork::fork_source_lock_path(id))?;
+    }
+    require_absent(&Path::new(POD_SHARE_HOST_ROOT).join(id))
+}
+
+pub(crate) fn cleanup_sandbox(id: &str, stop: bool) -> Result<(), String> {
+    let mut budget = AttemptBudget::configured()?;
+    let rt = smolvm::embedded::runtime().map_err(|error| error.to_string())?;
+    if let Some(budget) = budget.as_ref() {
+        match budget.attempt(id)? {
+            Attempt::Unknown => return verify_sandbox_absent(rt, id, false),
+            Attempt::Retired => return verify_sandbox_absent(rt, id, true),
+            Attempt::Pending => {}
+        }
+    }
+
+    if stop {
+        if let Err(error) = rt.stop_machine(id) {
+            warn!("stop sandbox VM {id}: {error}");
+        }
+    }
+    rt.delete_machine(id)
+        .map_err(|error| format!("delete sandbox VM: {error}"))?;
+    if let Some(budget) = budget.as_mut() {
+        verify_vm_absent(rt, id)?;
+        remove_sandbox_share(id).map_err(|error| format!("remove sandbox share {id}: {error}"))?;
+        require_absent(&Path::new(POD_SHARE_HOST_ROOT).join(id))?;
+        budget.retire()?;
+    } else if let Err(error) = remove_sandbox_share(id) {
+        warn!("remove sandbox share {id}: {error}");
+    }
+    Ok(())
 }
 
 const POD_SHARE_GUEST_PATH: &str = "/podshare";
@@ -670,6 +727,18 @@ impl PodBackend for EnginePodBackend {
                 );
             }
 
+            // Hold the register lock through create/start so the separate binary
+            // Delete cannot retire this admission while its VM is still starting.
+            let mut budget = AttemptBudget::configured()?;
+            if let Some(budget) = budget.as_mut() {
+                budget
+                    .admit(&id_owned, || {
+                        let rt = smolvm::embedded::runtime().map_err(|error| error.to_string())?;
+                        verify_sandbox_absent(rt, &id_owned, false)
+                    })
+                    .map_err(|error| format!("sandbox {id_owned}: {error}"))?;
+            }
+
             // The bundle lives under /run/containerd/... which the engine's mount
             // validation rejects as a protected system path. Host the pod share
             // in a dedicated, non-protected dir keyed by sandbox id instead.
@@ -719,7 +788,7 @@ impl PodBackend for EnginePodBackend {
                 Err(smolvm::Error::Agent {
                     kind: smolvm::error::AgentErrorKind::Conflict,
                     ..
-                }) => {
+                }) if budget.is_none() => {
                     warn!("sandbox machine {id_owned} already exists; recreating");
                     let _ = rt.delete_machine(&id_owned);
                     rt.create_machine(spec).map_err(|e| e.to_string())?;
@@ -1009,20 +1078,9 @@ impl PodBackend for EnginePodBackend {
         if self.is_sandbox_task(id, exec_id) {
             // Sandbox delete = tear down the whole VM.
             let sandbox = self.sandbox()?;
-            tokio::task::spawn_blocking(move || {
-                let rt = smolvm::embedded::runtime().map_err(|e| e.to_string())?;
-                if let Err(e) = rt.stop_machine(&sandbox.id) {
-                    warn!("stop sandbox VM {}: {e}", sandbox.id);
-                }
-                rt.delete_machine(&sandbox.id)
-                    .map_err(|e| format!("delete sandbox VM: {e}"))?;
-                if let Err(e) = remove_sandbox_share(&sandbox.id) {
-                    warn!("remove sandbox share {}: {e}", sandbox.id);
-                }
-                Ok::<(), String>(())
-            })
-            .await
-            .map_err(|e| e.to_string())??;
+            tokio::task::spawn_blocking(move || cleanup_sandbox(&sandbox.id, true))
+                .await
+                .map_err(|e| e.to_string())??;
             *self.sandbox.lock().map_err(|e| e.to_string())? = None;
             self.procs.lock().map_err(|e| e.to_string())?.remove(&k);
             return Ok(());
