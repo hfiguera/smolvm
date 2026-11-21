@@ -28,6 +28,17 @@ fn main() {
     // boot subprocess must never register itself with containerd.
     let mut args = std::env::args_os().skip(1);
     let command = args.next();
+    if command.as_deref() == Some(std::ffi::OsStr::new("reconcile-sandbox-budget")) {
+        if args.next().is_some() {
+            eprintln!("reconcile-sandbox-budget takes no arguments");
+            std::process::exit(2);
+        }
+        if let Err(error) = engine::reconcile_sandbox_budget() {
+            eprintln!("sandbox budget reconciliation failed: {error}");
+            std::process::exit(1);
+        }
+        return;
+    }
     if matches!(
         command.as_deref().and_then(|a| a.to_str()),
         Some("_boot-vm" | "_boot-vm-owned")

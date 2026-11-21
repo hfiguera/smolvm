@@ -38,7 +38,7 @@ use smolvm::embedded::{EmbeddedRuntime, MachineSpec};
 use smolvm::network::NetworkBackend;
 use smolvm_protocol::{AgentRequest, AgentResponse};
 
-use crate::attempt_budget::{AttemptBudget, DIRECTORY_ENV};
+use crate::attempt_budget::{AttemptBudget, RuntimeStorage, DIRECTORY_ENV};
 use crate::backend::{ExitInfo, ExitWatch, PodBackend, ProcessSpec, Stdio};
 
 /// Nominal guest target recorded on the sandbox's single [`HostMount`]
@@ -121,6 +121,20 @@ fn reap_guarded_sandbox(id: &str, stop: bool) -> Result<(), String> {
     verify_vm_absent(&rt, id)?;
     remove_sandbox_share(id).map_err(|error| format!("remove sandbox share {id}: {error}"))?;
     require_absent(&Path::new(POD_SHARE_HOST_ROOT).join(id))
+}
+
+fn observe_runtime_storage() -> Result<RuntimeStorage, String> {
+    let database = smolvm::db::SmolvmDb::default_path().map_err(|error| error.to_string())?;
+    RuntimeStorage::read(&database, &smolvm::agent::vm_cache_root())
+        .map_err(|error| format!("inspect sandbox runtime storage: {error}"))
+}
+
+pub(crate) fn reconcile_sandbox_budget() -> Result<(), String> {
+    let mut budget =
+        AttemptBudget::configured()?.ok_or("sandbox attempt budget is not configured")?;
+    budget.reconcile(observe_runtime_storage, |id| {
+        reap_guarded_sandbox(id, false)
+    })
 }
 
 pub(crate) fn cleanup_sandbox(id: &str, stop: bool) -> Result<(), String> {
@@ -754,7 +768,10 @@ impl PodBackend for EnginePodBackend {
                         || {
                             let rt =
                                 smolvm::embedded::runtime().map_err(|error| error.to_string())?;
-                            verify_sandbox_absent(&rt, &id_owned, false)
+                            verify_sandbox_absent(&rt, &id_owned, false)?;
+                            std::fs::create_dir_all(smolvm::agent::vm_cache_root())
+                                .map_err(|error| format!("create sandbox VM cache: {error}"))?;
+                            observe_runtime_storage()
                         },
                     )
                 })

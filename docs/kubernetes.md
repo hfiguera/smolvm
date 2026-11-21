@@ -34,13 +34,14 @@ limit, and spent attempts stay charged after cleanup and across restarts.
 Containerd continues to report failed Pod sandbox creation when the limit has
 been reached.
 
-The shim records the original sandbox's Delete request before cleanup. If
-cleanup fails, the next sandbox Create retries that cleanup before evaluating
-its own admission. The shim holds an owner lock through Create and while the
-task is active. If the owner exits or Create fails, the next Create can use
-that lock to recover the original attempt even if the Delete request could
-not be recorded. Attempts already pending when upgrading from a register
-without ownership require a Delete for the original ID.
+The shim records the original sandbox's Delete request before cleanup and
+holds an owner lock through Create and while the task is active. Either a
+recorded Delete or a released owner lock allows cleanup to resume. Start the
+worker timer below so cleanup can make progress while admission is paused.
+Create also retries eligible cleanup before evaluating its own admission.
+Older pending attempts without recorded runtime storage can use the normal
+shim Create or Delete paths. Pending attempts without ownership require a
+Delete for the original ID.
 
 To provision a new register, run as the account that runs containerd:
 
@@ -61,6 +62,51 @@ Choose a limit from 1 to 2,048 based on the worker's storage and inventory
 budget. Retain the directory and original lock inodes for the life of the
 worker, including `sandbox-owner`, which the shim creates on first admission.
 Start with a freshly provisioned worker when renewing the budget.
+
+### Worker reconciliation timer
+
+On a systemd node, put the sandbox budget directory and SmolVM runtime
+environment (including any XDG data and cache overrides) in a root-owned
+`/etc/smolvm/sandbox-worker.env`. Set
+`EnvironmentFile=/etc/smolvm/sandbox-worker.env` in the `[Service]` section of
+the containerd or K3s service drop-in. Run the reconciliation service as the
+same account. The shim checks the recorded database and VM cache identities
+before the reconciliation service can clean up an attempt. Apply the drop-in
+when starting the guarded runtime, then enable the timer.
+
+Save as `/etc/systemd/system/smolvm-sandbox-reconcile.service`:
+
+```ini
+[Unit]
+Description=Reconcile the SmolVM worker's pending sandbox
+After=local-fs.target
+
+[Service]
+Type=oneshot
+EnvironmentFile=/etc/smolvm/sandbox-worker.env
+ExecStart=/usr/local/bin/containerd-shim-smolvm-v2 reconcile-sandbox-budget
+TimeoutStartSec=2min
+```
+
+Save as `/etc/systemd/system/smolvm-sandbox-reconcile.timer`:
+
+```ini
+[Unit]
+Description=Retry pending SmolVM sandbox cleanup
+
+[Timer]
+OnBootSec=10s
+OnUnitInactiveSec=10s
+AccuracySec=1s
+
+[Install]
+WantedBy=timers.target
+```
+
+```sh
+sudo systemctl daemon-reload
+sudo systemctl enable --now smolvm-sandbox-reconcile.timer
+```
 
 ## Shim child-process ownership
 

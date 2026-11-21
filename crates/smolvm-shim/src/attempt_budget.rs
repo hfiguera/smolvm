@@ -5,7 +5,7 @@
 //! same lock. The lock file is never replaced.
 
 use std::collections::BTreeSet;
-use std::fs::{self, File, OpenOptions, TryLockError};
+use std::fs::{self, File, Metadata, OpenOptions, TryLockError};
 use std::io::{self, Read, Write};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
@@ -31,22 +31,53 @@ struct Register {
     #[serde(default)]
     cleanup_requested: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    owner: Option<OwnerIdentity>,
+    owner: Option<FileIdentity>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    runtime: Option<RuntimeStorage>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(deny_unknown_fields)]
-struct OwnerIdentity {
+struct FileIdentity {
     device: u64,
     inode: u64,
 }
 
-impl OwnerIdentity {
-    fn of(file: &File) -> io::Result<Self> {
-        let metadata = file.metadata()?;
-        Ok(Self {
+impl FileIdentity {
+    fn of(metadata: &Metadata) -> Self {
+        Self {
             device: metadata.dev(),
             inode: metadata.ino(),
+        }
+    }
+}
+
+/// Storage observed by the writer before allocating anything for the attempt.
+#[derive(Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RuntimeStorage {
+    database: PathBuf,
+    database_identity: FileIdentity,
+    vm_root: PathBuf,
+    vm_root_identity: FileIdentity,
+}
+
+impl RuntimeStorage {
+    pub(crate) fn read(database: &Path, vm_root: &Path) -> io::Result<Self> {
+        let database = database.canonicalize()?;
+        let vm_root = vm_root.canonicalize()?;
+        let db_metadata = database.metadata()?;
+        let vm_metadata = vm_root.metadata()?;
+        if !db_metadata.is_file() || !vm_metadata.is_dir() {
+            return Err(io::Error::other(
+                "expected a VM database file and a VM cache directory",
+            ));
+        }
+        Ok(Self {
+            database,
+            database_identity: FileIdentity::of(&db_metadata),
+            vm_root,
+            vm_root_identity: FileIdentity::of(&vm_metadata),
         })
     }
 }
@@ -106,7 +137,9 @@ impl AttemptBudget {
             || register.admitted.len() > register.limit
             || unique.len() != register.admitted.len()
             || !register.admitted.iter().all(|id| valid_id(id))
-            || ((register.cleanup_requested || register.owner.is_some())
+            || ((register.cleanup_requested
+                || register.owner.is_some()
+                || register.runtime.is_some())
                 && register.pending.is_none())
             || register
                 .pending
@@ -140,10 +173,10 @@ impl AttemptBudget {
         &mut self,
         id: &str,
         reap: impl FnOnce(&str) -> Result<(), String>,
-        verify_unused: impl FnOnce() -> Result<(), String>,
+        verify_unused: impl FnOnce() -> Result<RuntimeStorage, String>,
     ) -> Result<File, String> {
         let attempt = self.attempt(id)?;
-        self.retry_cleanup(reap)?;
+        self.retry_cleanup(|id, _| reap(id))?;
         if attempt != Attempt::Unknown {
             return Err("sandbox attempt was already admitted".into());
         }
@@ -153,11 +186,13 @@ impl AttemptBudget {
         if self.register.pending.is_some() {
             return Err("previous sandbox attempt still requires cleanup".into());
         }
-        verify_unused()?;
+        let runtime = verify_unused()?;
         let owner = self
             .try_lock_owner(None)?
             .ok_or("previous sandbox owner still holds its lock")?;
-        self.register.owner = Some(OwnerIdentity::of(&owner).map_err(|error| error.to_string())?);
+        let metadata = owner.metadata().map_err(|error| error.to_string())?;
+        self.register.owner = Some(FileIdentity::of(&metadata));
+        self.register.runtime = Some(runtime);
         self.register.admitted.push(id.into());
         self.register.pending = Some(id.into());
         self.persist()?;
@@ -182,12 +217,27 @@ impl AttemptBudget {
             self.register.cleanup_requested = true;
             self.persist()?;
         }
-        self.retry_cleanup(reap)
+        self.retry_cleanup(|id, _| reap(id))
+    }
+
+    /// The node timer calls this independently of any Create or Delete.
+    pub(crate) fn reconcile(
+        &mut self,
+        observe_runtime: impl FnOnce() -> Result<RuntimeStorage, String>,
+        reap: impl FnOnce(&str) -> Result<(), String>,
+    ) -> Result<(), String> {
+        self.retry_cleanup(|id, expected| {
+            let expected = expected.ok_or("original sandbox has no recorded runtime storage")?;
+            if &observe_runtime()? != expected {
+                return Err("worker runtime storage differs from the admitted sandbox".into());
+            }
+            reap(id)
+        })
     }
 
     fn retry_cleanup(
         &mut self,
-        reap: impl FnOnce(&str) -> Result<(), String>,
+        reap: impl FnOnce(&str, Option<&RuntimeStorage>) -> Result<(), String>,
     ) -> Result<(), String> {
         let Some(id) = self.register.pending.as_deref() else {
             return Ok(());
@@ -205,14 +255,16 @@ impl AttemptBudget {
             };
             Some(owner)
         };
-        reap(id).map_err(|error| format!("cleanup of sandbox {id}: {error}"))?;
+        reap(id, self.register.runtime.as_ref())
+            .map_err(|error| format!("cleanup of sandbox {id}: {error}"))?;
         self.register.pending = None;
         self.register.cleanup_requested = false;
         self.register.owner = None;
+        self.register.runtime = None;
         self.persist()
     }
 
-    fn try_lock_owner(&self, expected: Option<OwnerIdentity>) -> Result<Option<File>, String> {
+    fn try_lock_owner(&self, expected: Option<FileIdentity>) -> Result<Option<File>, String> {
         let path = self.directory.join(OWNER_LOCK);
         let file = match open_private(&path, self.uid) {
             Err(error) if error.kind() == io::ErrorKind::NotFound && expected.is_none() => {
@@ -232,7 +284,8 @@ impl AttemptBudget {
         }
         .map_err(|error| format!("open sandbox owner lock: {error}"))?;
         if let Some(expected) = expected {
-            let actual = OwnerIdentity::of(&file).map_err(|error| error.to_string())?;
+            let metadata = file.metadata().map_err(|error| error.to_string())?;
+            let actual = FileIdentity::of(&metadata);
             if actual != expected {
                 return Err("sandbox owner lock identity changed".into());
             }
@@ -316,7 +369,14 @@ mod tests {
                 .unwrap();
             }
         }
+        File::create(directory.path().join("runtime.db")).unwrap();
+        fs::create_dir(directory.path().join("vms")).unwrap();
         directory
+    }
+
+    fn runtime_storage(path: &Path) -> Result<RuntimeStorage, String> {
+        RuntimeStorage::read(&path.join("runtime.db"), &path.join("vms"))
+            .map_err(|error| error.to_string())
     }
 
     use std::os::unix::fs::PermissionsExt;
@@ -327,7 +387,11 @@ mod tests {
         let id = "a".repeat(64);
         let _owner = AttemptBudget::open(directory.path())
             .unwrap()
-            .admit(&id, |_| unreachable!(), || Ok(()))
+            .admit(
+                &id,
+                |_| unreachable!(),
+                || runtime_storage(directory.path()),
+            )
             .unwrap();
         let mut restarted = AttemptBudget::open(directory.path()).unwrap();
         assert_eq!(restarted.attempt(&id).unwrap(), Attempt::Pending);
@@ -380,7 +444,7 @@ mod tests {
                 AttemptBudget::open(&path).unwrap().admit(
                     &prefix.repeat(64),
                     |_| unreachable!(),
-                    || Ok(()),
+                    || runtime_storage(&path),
                 )
             })
         });
@@ -410,7 +474,11 @@ mod tests {
         let next = "b".repeat(64);
         let mut budget = AttemptBudget::open(directory.path()).unwrap();
         let owner = budget
-            .admit(&original, |_| unreachable!(), || Ok(()))
+            .admit(
+                &original,
+                |_| unreachable!(),
+                || runtime_storage(directory.path()),
+            )
             .unwrap();
         budget
             .cleanup(
@@ -469,7 +537,7 @@ mod tests {
                     assert_eq!(id, original);
                     Ok(())
                 },
-                || Ok(()),
+                || runtime_storage(directory.path()),
             )
             .expect("recover the original cleanup and admit the replacement");
         assert_eq!(reopened.register.admitted, [original.clone(), next.clone()]);
@@ -484,7 +552,11 @@ mod tests {
         let next = "b".repeat(64);
         let mut budget = AttemptBudget::open(directory.path()).unwrap();
         let owner = budget
-            .admit(&original, |_| unreachable!(), || Ok(()))
+            .admit(
+                &original,
+                |_| unreachable!(),
+                || runtime_storage(directory.path()),
+            )
             .unwrap();
 
         let blocked_update = directory.path().join(NEXT_REGISTER);
@@ -512,7 +584,7 @@ mod tests {
                     assert_eq!(id, original);
                     Ok(())
                 },
-                || Ok(()),
+                || runtime_storage(directory.path()),
             )
             .expect("recover the original cleanup after the register write failure");
         assert_eq!(reopened.attempt(&original).unwrap(), Attempt::Retired);
@@ -526,7 +598,11 @@ mod tests {
         let next = "b".repeat(64);
         let mut budget = AttemptBudget::open(directory.path()).unwrap();
         let _owner = budget
-            .admit(&original, |_| unreachable!(), || Ok(()))
+            .admit(
+                &original,
+                |_| unreachable!(),
+                || runtime_storage(directory.path()),
+            )
             .unwrap();
 
         let path = directory.path().join(OWNER_LOCK);
@@ -575,7 +651,70 @@ mod tests {
                 },
             )
             .unwrap();
-        let _next_owner = budget.admit(&next, |_| unreachable!(), || Ok(())).unwrap();
+        let _next_owner = budget
+            .admit(
+                &next,
+                |_| unreachable!(),
+                || runtime_storage(directory.path()),
+            )
+            .unwrap();
         assert_eq!(budget.register.admitted, [original, next]);
+    }
+
+    #[test]
+    fn abandoned_attempt_recovers_without_new_admission() {
+        let directory = fixture(1);
+        let original = "a".repeat(64);
+        let mut budget = AttemptBudget::open(directory.path()).unwrap();
+        let owner = budget
+            .admit(
+                &original,
+                |_| unreachable!(),
+                || runtime_storage(directory.path()),
+            )
+            .unwrap();
+        budget
+            .reconcile(|| unreachable!(), |_| unreachable!())
+            .unwrap();
+        assert_eq!(budget.attempt(&original), Ok(Attempt::Pending));
+        assert!(budget
+            .cleanup(
+                &original,
+                |_| unreachable!(),
+                |_| Err("temporary cleanup failure".into())
+            )
+            .is_err());
+        drop(budget);
+        drop(owner);
+
+        // The gateway only observes until the original attempt settles.
+        // No successor is submitted to the shim in this test.
+        let mut reopened = AttemptBudget::open(directory.path()).unwrap();
+        let alternate_worker = fixture(1);
+        let error = reopened
+            .reconcile(
+                || runtime_storage(alternate_worker.path()),
+                |_| unreachable!(),
+            )
+            .unwrap_err();
+        assert!(error.ends_with("worker runtime storage differs from the admitted sandbox"));
+        assert_eq!(reopened.attempt(&original), Ok(Attempt::Pending));
+        reopened
+            .reconcile(
+                || runtime_storage(directory.path()),
+                |id| {
+                    assert_eq!(id, original);
+                    Ok(())
+                },
+            )
+            .unwrap();
+        drop(reopened);
+        let reopened = AttemptBudget::open(directory.path()).unwrap();
+        assert_eq!(
+            reopened.attempt(&original),
+            Ok(Attempt::Retired),
+            "the worker must settle the original before the gateway can admit again"
+        );
+        assert_eq!(reopened.register.admitted, [original]);
     }
 }
