@@ -39,6 +39,7 @@ holds an owner lock through Create and while the task is active. Either a
 recorded Delete or a released owner lock allows cleanup to resume. Start the
 worker timer below so cleanup can make progress while admission is paused.
 Create also retries eligible cleanup before evaluating its own admission.
+The VM and share directory removals are synced before the attempt is retired.
 Older pending attempts without recorded runtime storage can use the normal
 shim Create or Delete paths. Pending attempts without ownership require a
 Delete for the original ID.

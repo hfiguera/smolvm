@@ -344,6 +344,41 @@ fn failed_owned_deletion_preserves_stopped_record_and_storage_for_retry() {
     );
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn sandbox_deletion_keeps_its_row_when_directory_sync_fails() {
+    isolated(
+        "sandbox_deletion_keeps_its_row_when_directory_sync_fails",
+        || {
+            let (db, record) = fixture();
+            db.update_vm(&record.name, |row| row.runtime_managed = true)
+                .unwrap();
+            let record = db.get_vm(&record.name).unwrap().unwrap();
+            let root = tempfile::tempdir().unwrap();
+            let vm_root = root.path().join("vms");
+            let runtime = vm_root.join("sandbox");
+            fs::create_dir_all(&runtime).unwrap();
+
+            let mut guard = db.reserve_vm_deletion_at(&record, &runtime).unwrap();
+            guard.prepare_delete().unwrap();
+            fs::remove_dir(&runtime).unwrap();
+            fs::remove_dir(&vm_root).unwrap();
+            let error = guard.finish_delete().unwrap_err();
+            assert!(error
+                .to_string()
+                .contains("sync sandbox VM directory removal"));
+            let stopped = db.get_vm(&record.name).unwrap().unwrap();
+            assert_eq!(stopped.database_identity, record.database_identity);
+
+            fs::create_dir(&vm_root).unwrap();
+            let mut retry = db.reserve_vm_deletion_at(&stopped, &runtime).unwrap();
+            retry.prepare_delete().unwrap();
+            retry.finish_delete().unwrap();
+            assert!(db.get_vm(&record.name).unwrap().is_none());
+        },
+    );
+}
+
 #[test]
 fn reviewed_deletion_refuses_a_replacement_before_touching_storage() {
     isolated(

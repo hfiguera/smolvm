@@ -446,6 +446,25 @@ impl VmRecoveryGuard {
         if self.owner != ProcessIdentity::current()? {
             return Err(conflict("deletion belongs to another process"));
         }
+        #[cfg(target_os = "linux")]
+        if self.record.runtime_managed {
+            use std::os::unix::fs::OpenOptionsExt;
+
+            // A runtime-managed sandbox needs its row to retry deleting a
+            // VM directory. Sync the removal before durably losing the row.
+            let parent = self
+                .runtime
+                .parent()
+                .ok_or_else(|| conflict("sandbox VM directory has no parent"))?;
+            std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_DIRECTORY)
+                .open(parent)
+                .and_then(|dir| dir.sync_all())
+                .map_err(|error| {
+                    Error::storage("sync sandbox VM directory removal", error.to_string())
+                })?;
+        }
         let removed = self.db.with_durable_conn(|conn| {
             let tx = conn
                 .transaction_with_behavior(TransactionBehavior::Immediate)

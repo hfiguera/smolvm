@@ -21,8 +21,9 @@
 //! `tokio::task::spawn_blocking`.
 
 use std::collections::HashMap;
-use std::fs::File;
+use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, TryRecvError};
@@ -86,7 +87,7 @@ fn require_absent(path: &Path) -> Result<(), String> {
     }
 }
 
-fn verify_vm_absent(rt: &EmbeddedRuntime, id: &str) -> Result<(), String> {
+fn verify_vm_record_absent(rt: &EmbeddedRuntime, id: &str) -> Result<(), String> {
     if rt
         .machine_record(id)
         .map_err(|error| error.to_string())?
@@ -94,11 +95,12 @@ fn verify_vm_absent(rt: &EmbeddedRuntime, id: &str) -> Result<(), String> {
     {
         return Err(format!("sandbox {id} still has a VM record"));
     }
-    require_absent(&smolvm::agent::vm_data_dir(id))
+    Ok(())
 }
 
 fn verify_sandbox_absent(rt: &EmbeddedRuntime, id: &str, allow_lock: bool) -> Result<(), String> {
-    verify_vm_absent(rt, id)?;
+    verify_vm_record_absent(rt, id)?;
+    require_absent(&smolvm::agent::vm_data_dir(id))?;
     if !allow_lock {
         require_absent(&smolvm::agent::fork::fork_source_lock_path(id))?;
     }
@@ -118,9 +120,56 @@ fn delete_sandbox_vm(rt: &EmbeddedRuntime, id: &str, stop: bool) -> Result<(), S
 fn reap_guarded_sandbox(id: &str, stop: bool) -> Result<(), String> {
     let rt = smolvm::embedded::runtime().map_err(|error| error.to_string())?;
     delete_sandbox_vm(&rt, id, stop)?;
-    verify_vm_absent(&rt, id)?;
-    remove_sandbox_share(id).map_err(|error| format!("remove sandbox share {id}: {error}"))?;
-    require_absent(&Path::new(POD_SHARE_HOST_ROOT).join(id))
+    verify_vm_record_absent(&rt, id)?;
+    finish_guarded_cleanup(
+        id,
+        &smolvm::agent::vm_data_dir(id),
+        Path::new(POD_SHARE_HOST_ROOT),
+        sync_cleanup_directory,
+    )
+}
+
+fn finish_guarded_cleanup(
+    id: &str,
+    vm_dir: &Path,
+    share_root: &Path,
+    mut sync_directory: impl FnMut(&Path) -> std::io::Result<()>,
+) -> Result<(), String> {
+    require_absent(vm_dir)?;
+    remove_sandbox_share_at(share_root, id)
+        .map_err(|error| format!("remove sandbox share {id}: {error}"))?;
+    require_absent(&share_root.join(id))?;
+
+    // The register can be on another filesystem. Make both removals durable
+    // before its caller can retire the attempt, including on retry.
+    let vm_root = vm_dir
+        .parent()
+        .ok_or("sandbox VM directory has no parent")?;
+    for directory in [vm_root, share_root] {
+        sync_directory(directory)
+            .map_err(|error| format!("sync sandbox cleanup {}: {error}", directory.display()))?;
+    }
+    Ok(())
+}
+
+fn sync_cleanup_directory(directory: &Path) -> std::io::Result<()> {
+    // An attempt can fail before creating the share root. Sync the nearest
+    // existing parent so its absence is durable as well.
+    for parent in directory.ancestors() {
+        match OpenOptions::new()
+            .read(true)
+            .custom_flags(nix::libc::O_DIRECTORY)
+            .open(parent)
+        {
+            Ok(file) => return file.sync_all(),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::NotFound,
+        "sandbox cleanup directory has no existing ancestor",
+    ))
 }
 
 fn observe_runtime_storage() -> Result<RuntimeStorage, String> {
@@ -1573,6 +1622,46 @@ mod tests {
         assert!(live.exists());
         assert!(remove_sandbox_share_at(root.path(), "../live-pod").is_err());
         assert!(live.exists());
+    }
+
+    #[test]
+    fn guarded_cleanup_requires_durable_directory_removals() {
+        let root = tempfile::tempdir().unwrap();
+        let vm_root = root.path().join("vms");
+        let share_root = root.path().join("shares");
+        let id = "original";
+        let vm_dir = vm_root.join("hashed-id");
+        let share = share_root.join(id);
+        std::fs::create_dir_all(&vm_dir).unwrap();
+        std::fs::create_dir_all(&share).unwrap();
+        std::fs::remove_dir(&vm_dir).unwrap();
+
+        let mut synced = Vec::new();
+        let result = finish_guarded_cleanup(id, &vm_dir, &share_root, |directory| {
+            assert!(!vm_dir.exists() && !share.exists());
+            synced.push(directory.to_path_buf());
+            if directory == share_root {
+                return Err(std::io::Error::other("temporary directory sync failure"));
+            }
+            Ok(())
+        });
+        assert!(
+            result.is_err_and(|error| error.ends_with("temporary directory sync failure")),
+            "cleanup must fail before retirement when the share removal cannot be synced"
+        );
+        assert_eq!(synced, [vm_root.clone(), share_root.clone()]);
+
+        // A retry still has to sync the removals even though both paths are gone.
+        synced.clear();
+        finish_guarded_cleanup(id, &vm_dir, &share_root, |directory| {
+            synced.push(directory.to_path_buf());
+            sync_cleanup_directory(directory)
+        })
+        .unwrap();
+        assert_eq!(synced, [vm_root, share_root.clone()]);
+
+        std::fs::remove_dir(&share_root).unwrap();
+        finish_guarded_cleanup(id, &vm_dir, &share_root, sync_cleanup_directory).unwrap();
     }
 
     #[test]
