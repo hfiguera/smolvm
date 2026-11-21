@@ -224,6 +224,27 @@ impl AttemptBudget {
         Ok(())
     }
 
+    /// Deliver a saved Delete to the shim that holds the original owner file.
+    pub(crate) fn deliver_cleanup_request(
+        self,
+        id: &str,
+        owner: &File,
+        cleanup: impl FnOnce() -> Result<(), String>,
+    ) -> Result<bool, String> {
+        if !self.register.cleanup_requested || self.register.pending.as_deref() != Some(id) {
+            return Ok(false);
+        }
+        let metadata = owner.metadata().map_err(|error| error.to_string())?;
+        if self.register.owner != Some(FileIdentity::of(&metadata)) {
+            return Err("saved sandbox cleanup does not match the owner file".into());
+        }
+        // The owner must release its share writers and re-enter cleanup
+        // without holding the register lock.
+        drop(self);
+        cleanup()?;
+        Ok(true)
+    }
+
     /// The node timer calls this independently of any Create or Delete.
     pub(crate) fn reconcile(
         &mut self,
@@ -728,5 +749,81 @@ mod tests {
             "the worker must settle the original before the gateway can admit again"
         );
         assert_eq!(reopened.register.admitted, [original]);
+    }
+
+    #[test]
+    fn disconnected_live_owner_can_settle_saved_delete() {
+        let directory = fixture(1);
+        let original = "a".repeat(64);
+        let owner = AttemptBudget::open(directory.path())
+            .unwrap()
+            .admit(
+                &original,
+                |_| unreachable!(),
+                || runtime_storage(directory.path()),
+            )
+            .unwrap();
+
+        let mut disconnected = AttemptBudget::open(directory.path()).unwrap();
+        assert_eq!(
+            disconnected
+                .cleanup(&original, |_| unreachable!(), |_| unreachable!())
+                .unwrap_err(),
+            format!("sandbox {original} still has an active owner")
+        );
+        drop(disconnected);
+
+        // The shim is alive after the disconnect. It still holds the owner
+        // descriptor, and the caller sends no further task RPC.
+        let mut timer = AttemptBudget::open(directory.path()).unwrap();
+        timer
+            .reconcile(|| unreachable!(), |_| unreachable!())
+            .unwrap();
+        assert_eq!(timer.attempt(&original), Ok(Attempt::Pending));
+        assert!(!timer
+            .deliver_cleanup_request(&"b".repeat(64), &owner, || unreachable!())
+            .unwrap());
+        let unrelated = File::open(directory.path().join("lock")).unwrap();
+        let timer = AttemptBudget::open(directory.path()).unwrap();
+        assert!(timer
+            .deliver_cleanup_request(&original, &unrelated, || unreachable!())
+            .is_err());
+
+        let saved = AttemptBudget::open(directory.path()).unwrap();
+        assert!(saved
+            .deliver_cleanup_request(&original, &owner, || {
+                owner.unlock().unwrap();
+                let reopened = AttemptBudget::open(directory.path()).unwrap();
+                assert_eq!(reopened.attempt(&original), Ok(Attempt::Pending));
+                Ok(())
+            })
+            .unwrap());
+        let mut timer = AttemptBudget::open(directory.path()).unwrap();
+        timer
+            .reconcile(
+                || runtime_storage(directory.path()),
+                |id| {
+                    assert_eq!(id, original);
+                    Ok(())
+                },
+            )
+            .unwrap();
+        timer
+            .cleanup(
+                &original,
+                |allow_lock| {
+                    assert!(allow_lock);
+                    Ok(())
+                },
+                |_| unreachable!(),
+            )
+            .unwrap();
+        assert_eq!(
+            timer.attempt(&original),
+            Ok(Attempt::Retired),
+            "a saved Delete must reach the live owner without another task RPC"
+        );
+        assert_eq!(timer.register.admitted, [original]);
+        drop(owner);
     }
 }

@@ -38,8 +38,10 @@ The shim records the original sandbox's Delete request before cleanup and
 holds an owner lock through Create and while the task is active. Sandbox
 Delete stops new share writes and drains active staging before releasing
 that lock. The worker waits for the recorded owner lock before cleaning up
-a tracked attempt. Start the worker timer below so cleanup can make progress
-while admission is paused.
+a tracked attempt. If containerd disconnects while the owner is alive, the
+shim observes the saved Delete, drains its share writers, and exits after
+cleanup. Start the worker timer below so cleanup can make progress while
+admission is paused.
 Create also retries eligible cleanup before evaluating its own admission.
 The VM and share directory removals are synced before the attempt is retired.
 Older pending attempts without recorded runtime storage can use the normal

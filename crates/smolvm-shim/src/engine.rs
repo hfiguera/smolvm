@@ -429,6 +429,48 @@ impl EnginePodBackend {
                 .unwrap_or(false)
     }
 
+    pub(crate) async fn wait_for_cleanup_request(&self) {
+        let mut timer = tokio::time::interval(Duration::from_secs(1));
+        timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let id = loop {
+            timer.tick().await;
+            let Ok(sandbox) = self.sandbox() else {
+                continue;
+            };
+            let result = tokio::task::spawn_blocking(move || {
+                let (Some(owner), Some(budget)) =
+                    (sandbox.attempt_owner.as_ref(), AttemptBudget::configured()?)
+                else {
+                    return Ok(None);
+                };
+                let handed_off =
+                    budget.deliver_cleanup_request(&sandbox.id, owner, || sandbox.close_share())?;
+                Ok::<_, String>(handed_off.then(|| sandbox.id.clone()))
+            })
+            .await;
+            match result {
+                Ok(Ok(Some(id))) => break id,
+                Ok(Ok(None)) => {}
+                Ok(Err(error)) => warn!("sandbox cleanup request handoff failed: {error}"),
+                Err(error) => warn!("sandbox cleanup worker failed: {error}"),
+            }
+        };
+
+        // Retry the exact original ID even if the timer retired it after
+        // ownership was released. The retired Delete verifies the teardown.
+        loop {
+            let original = id.clone();
+            let result =
+                tokio::task::spawn_blocking(move || cleanup_sandbox(&original, false)).await;
+            match result {
+                Ok(Ok(())) => return,
+                Ok(Err(error)) => warn!("requested sandbox cleanup must be retried: {error}"),
+                Err(error) => warn!("sandbox cleanup worker failed: {error}"),
+            }
+            timer.tick().await;
+        }
+    }
+
     fn insert_proc(&self, k: String, entry: ProcEntry) -> Result<(), String> {
         self.procs
             .lock()

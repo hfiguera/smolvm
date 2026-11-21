@@ -1,7 +1,7 @@
 //! Shim v2 process lifecycle: what containerd invokes to start/stop the shim
 //! itself. One shim process serves one pod (grouped by task id).
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use async_trait::async_trait;
 use containerd_shim::asynchronous::{run, spawn, ExitSignal, Shim};
@@ -20,6 +20,7 @@ pub const RUNTIME_ID: &str = "io.containerd.smolvm.v2";
 
 pub struct Service {
     exit: Arc<ExitSignal>,
+    backend: OnceLock<Arc<ShimBackend>>,
     namespace: String,
     /// Task id containerd invoked us with. For the sandbox shim this is the
     /// sandbox id, which is also the persistent machine's name — used by
@@ -36,6 +37,7 @@ impl Shim for Service {
     async fn new(_runtime_id: &str, args: &Flags, _config: &mut Config) -> Self {
         Service {
             exit: Arc::new(ExitSignal::default()),
+            backend: OnceLock::new(),
             namespace: args.namespace.clone(),
             id: args.id.clone(),
         }
@@ -54,11 +56,9 @@ impl Shim for Service {
     }
 
     async fn delete_shim(&mut self) -> Result<DeleteResponse, Error> {
-        // Recovery cleanup: containerd invokes the shim binary's `delete` action
-        // to reap a shim whose process is already gone (crash, force-delete). The
-        // sandbox VM is a persistent machine named after the sandbox id and would
-        // otherwise leak, so tear it down here. The runtime reads its machine
-        // state from disk, so a fresh process can still find and kill the VM.
+        // Containerd invokes the shim binary's `delete` action after disconnect.
+        // A live guarded owner handles the saved request in wait(); after its
+        // exit, a fresh process can still find and clean up the persisted VM.
         // Best-effort — a missing machine (a container-task delete, or a VM
         // already cleaned by the graceful path) is not an error.
         let id = self.id.clone();
@@ -80,18 +80,30 @@ impl Shim for Service {
     }
 
     async fn wait(&mut self) {
-        self.exit.wait().await;
+        if let (true, Some(ShimBackend::Engine(backend))) = (
+            std::env::var_os(DIRECTORY_ENV).is_some(),
+            self.backend.get().map(Arc::as_ref),
+        ) {
+            tokio::select! {
+                _ = self.exit.wait() => {},
+                _ = backend.wait_for_cleanup_request() => {},
+            }
+        } else {
+            self.exit.wait().await;
+        }
     }
 
     async fn create_task_service(&self, publisher: RemotePublisher) -> Self::T {
-        let backend = if std::env::var("SMOLVM_SHIM_MOCK").as_deref() == Ok("1") {
-            warn!("SMOLVM_SHIM_MOCK=1: using mock backend (no VMs will boot)");
-            ShimBackend::Mock(MockBackend::default())
-        } else {
-            ShimBackend::Engine(EnginePodBackend::new())
-        };
+        let backend = self.backend.get_or_init(|| {
+            Arc::new(if std::env::var("SMOLVM_SHIM_MOCK").as_deref() == Ok("1") {
+                warn!("SMOLVM_SHIM_MOCK=1: using mock backend (no VMs will boot)");
+                ShimBackend::Mock(MockBackend::default())
+            } else {
+                ShimBackend::Engine(EnginePodBackend::new())
+            })
+        });
         TaskService::new(
-            Arc::new(backend),
+            backend.clone(),
             Some(Arc::new(publisher)),
             self.namespace.clone(),
             self.exit.clone(),
