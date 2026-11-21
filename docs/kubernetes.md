@@ -35,9 +35,11 @@ Containerd continues to report failed Pod sandbox creation when the limit has
 been reached.
 
 The shim records the original sandbox's Delete request before cleanup and
-holds an owner lock through Create and while the task is active. Either a
-recorded Delete or a released owner lock allows cleanup to resume. Start the
-worker timer below so cleanup can make progress while admission is paused.
+holds an owner lock through Create and while the task is active. Sandbox
+Delete stops new share writes and drains active staging before releasing
+that lock. The worker waits for the recorded owner lock before cleaning up
+a tracked attempt. Start the worker timer below so cleanup can make progress
+while admission is paused.
 Create also retries eligible cleanup before evaluating its own admission.
 The VM and share directory removals are synced before the attempt is retired.
 Older pending attempts without recorded runtime storage can use the normal

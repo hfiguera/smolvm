@@ -25,9 +25,9 @@ use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, TryRecvError};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock, RwLockReadGuard};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -313,6 +313,8 @@ struct Sandbox {
     attempt_owner: Option<File>,
     /// Host dir shared into the guest (`<bundle>/podshare`).
     share_dir: PathBuf,
+    share_closing: AtomicBool,
+    share_writers: RwLock<()>,
     /// Host-side unix socket bridging to the guest agent's vsock port.
     socket: PathBuf,
     /// Pod network namespace path (recorded now, wired by the netns-tap
@@ -326,6 +328,36 @@ struct Sandbox {
     /// container's spec so crun applies them in the container's namespaces —
     /// the VM-per-pod equivalent of runc inheriting them from the shared pause.
     sysctls: Option<serde_json::Value>,
+}
+
+impl Sandbox {
+    fn share_writer(&self) -> Result<RwLockReadGuard<'_, ()>, String> {
+        if self.share_closing.load(Ordering::Acquire) {
+            return Err("sandbox share is closing".into());
+        }
+        let writer = self
+            .share_writers
+            .read()
+            .map_err(|error| error.to_string())?;
+        if self.share_closing.load(Ordering::Acquire) {
+            return Err("sandbox share is closing".into());
+        }
+        Ok(writer)
+    }
+
+    fn close_share(&self) -> Result<(), String> {
+        self.share_closing.store(true, Ordering::Release);
+        // Drain the blocking workers themselves. An RPC can be cancelled
+        // while its worker is still copying host files.
+        let _writers = self
+            .share_writers
+            .write()
+            .map_err(|error| error.to_string())?;
+        if let Some(owner) = &self.attempt_owner {
+            owner.unlock().map_err(|error| error.to_string())?;
+        }
+        Ok(())
+    }
 }
 
 struct ProcEntry {
@@ -911,6 +943,8 @@ impl PodBackend for EnginePodBackend {
                     id: id_owned,
                     attempt_owner,
                     share_dir,
+                    share_closing: AtomicBool::new(false),
+                    share_writers: RwLock::new(()),
                     socket,
                     netns,
                     hostname,
@@ -934,6 +968,7 @@ impl PodBackend for EnginePodBackend {
         let pid = next_pid();
 
         tokio::task::spawn_blocking(move || {
+            let writer = sandbox.share_writer()?;
             // Materialize the container rootfs under the pod share as plain
             // files, so the guest sees it through the boot-time virtiofs mount.
             //
@@ -990,6 +1025,7 @@ impl PodBackend for EnginePodBackend {
                 sandbox.hostname.as_deref(),
                 sandbox.sysctls.as_ref(),
             )?;
+            drop(writer);
 
             let resp = pod_request(
                 &sandbox.socket,
@@ -1168,9 +1204,7 @@ impl PodBackend for EnginePodBackend {
             // Sandbox delete = tear down the whole VM.
             let sandbox = self.sandbox()?;
             tokio::task::spawn_blocking(move || {
-                if let Some(owner) = &sandbox.attempt_owner {
-                    owner.unlock().map_err(|error| error.to_string())?;
-                }
+                sandbox.close_share()?;
                 cleanup_sandbox(&sandbox.id, true)
             })
             .await
@@ -1662,6 +1696,70 @@ mod tests {
 
         std::fs::remove_dir(&share_root).unwrap();
         finish_guarded_cleanup(id, &vm_dir, &share_root, sync_cleanup_directory).unwrap();
+    }
+
+    #[test]
+    fn delayed_container_create_cannot_recreate_a_retired_share() {
+        let root = tempfile::tempdir().unwrap();
+        let share_root = root.path().join("shares");
+        let owner_path = root.path().join("sandbox-owner");
+        let owner = File::create(&owner_path).unwrap();
+        owner.lock().unwrap();
+        let sandbox = Arc::new(Sandbox {
+            id: "original".into(),
+            attempt_owner: Some(owner),
+            share_dir: share_root.join("original/podshare"),
+            share_closing: AtomicBool::new(false),
+            share_writers: RwLock::new(()),
+            socket: root.path().join("agent.sock"),
+            netns: None,
+            hostname: None,
+            sysctls: None,
+        });
+        std::fs::create_dir_all(&sandbox.share_dir).unwrap();
+        let vm_dir = root.path().join("vms/original");
+        let (resume, paused) = std::sync::mpsc::channel();
+        let writer = {
+            let sandbox = sandbox.clone();
+            std::thread::spawn(move || {
+                paused.recv().unwrap();
+                let _writer = sandbox.share_writer()?;
+                std::fs::create_dir_all(sandbox.share_dir.join("container/rootfs"))
+                    .map_err(|error| error.to_string())
+            })
+        };
+
+        let active_writer = sandbox.share_writer().unwrap();
+        let closer = {
+            let sandbox = sandbox.clone();
+            std::thread::spawn(move || sandbox.close_share())
+        };
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !sandbox.share_closing.load(Ordering::Acquire) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "teardown never started"
+            );
+            std::thread::yield_now();
+        }
+        assert!(sandbox.share_writer().is_err());
+        let observer = File::open(owner_path).unwrap();
+        assert!(matches!(
+            observer.try_lock(),
+            Err(std::fs::TryLockError::WouldBlock)
+        ));
+        drop(active_writer);
+        closer.join().unwrap().unwrap();
+        observer.try_lock().unwrap();
+        finish_guarded_cleanup(&sandbox.id, &vm_dir, &share_root, sync_cleanup_directory).unwrap();
+        assert!(!share_root.join(&sandbox.id).exists());
+        resume.send(()).unwrap();
+        let result = writer.join().unwrap();
+        assert!(
+            !share_root.join(&sandbox.id).exists(),
+            "a delayed Create recreated the share after guarded cleanup completed"
+        );
+        assert!(result.is_err());
     }
 
     #[test]

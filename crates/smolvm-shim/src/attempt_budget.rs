@@ -217,7 +217,11 @@ impl AttemptBudget {
             self.register.cleanup_requested = true;
             self.persist()?;
         }
-        self.retry_cleanup(|id, _| reap(id))
+        self.retry_cleanup(|id, _| reap(id))?;
+        if self.register.pending.is_some() {
+            return Err(format!("sandbox {id} still has an active owner"));
+        }
+        Ok(())
     }
 
     /// The node timer calls this independently of any Create or Delete.
@@ -242,18 +246,17 @@ impl AttemptBudget {
         let Some(id) = self.register.pending.as_deref() else {
             return Ok(());
         };
-        let _abandoned_owner = if self.register.cleanup_requested {
-            None
-        } else {
-            // Failed Create or shim exit releases this lock. Keep it until
-            // cleanup commits. Legacy attempts need an explicit Delete.
-            let Some(expected) = self.register.owner else {
-                return Ok(());
-            };
-            let Some(owner) = self.try_lock_owner(Some(expected))? else {
-                return Ok(());
-            };
-            Some(owner)
+        // A tracked owner may still have share writers even after a Delete
+        // request. Hold the lock through cleanup and retirement.
+        let _owner = match self.register.owner {
+            Some(expected) => {
+                let Some(owner) = self.try_lock_owner(Some(expected))? else {
+                    return Ok(());
+                };
+                Some(owner)
+            }
+            None if self.register.cleanup_requested => None,
+            None => return Ok(()),
         };
         reap(id, self.register.runtime.as_ref())
             .map_err(|error| format!("cleanup of sandbox {id}: {error}"))?;
@@ -385,7 +388,7 @@ mod tests {
     fn lost_ack_and_cleanup_keep_the_debit() {
         let directory = fixture(1);
         let id = "a".repeat(64);
-        let _owner = AttemptBudget::open(directory.path())
+        let owner = AttemptBudget::open(directory.path())
             .unwrap()
             .admit(
                 &id,
@@ -409,10 +412,19 @@ mod tests {
             "sandbox attempt budget exhausted"
         );
         assert_eq!(restarted.attempt(&refused).unwrap(), Attempt::Unknown);
-        assert!(restarted
-            .cleanup(&id, |_| unreachable!(), |_| Err("temporary failure".into()))
-            .is_err());
+        assert_eq!(
+            restarted
+                .cleanup(&id, |_| unreachable!(), |_| unreachable!())
+                .unwrap_err(),
+            format!("sandbox {id} still has an active owner")
+        );
+        assert!(restarted.register.cleanup_requested);
+        restarted
+            .reconcile(|| unreachable!(), |_| unreachable!())
+            .unwrap();
+        assert_eq!(restarted.attempt(&id).unwrap(), Attempt::Pending);
         drop(restarted);
+        drop(owner);
         let mut restarted = AttemptBudget::open(directory.path()).unwrap();
         assert_eq!(restarted.attempt(&id).unwrap(), Attempt::Pending);
         assert_eq!(
@@ -496,6 +508,7 @@ mod tests {
                 .unwrap_err(),
             "previous sandbox attempt still requires cleanup"
         );
+        drop(owner);
         let temporary_error = format!("cleanup of sandbox {original}: temporary cleanup failure");
         assert_eq!(
             budget
@@ -527,7 +540,6 @@ mod tests {
             temporary_error
         );
         drop(reopened);
-        drop(owner);
 
         let mut reopened = AttemptBudget::open(directory.path()).unwrap();
         reopened
@@ -677,6 +689,7 @@ mod tests {
             .reconcile(|| unreachable!(), |_| unreachable!())
             .unwrap();
         assert_eq!(budget.attempt(&original), Ok(Attempt::Pending));
+        drop(owner);
         assert!(budget
             .cleanup(
                 &original,
@@ -685,7 +698,6 @@ mod tests {
             )
             .is_err());
         drop(budget);
-        drop(owner);
 
         // The gateway only observes until the original attempt settles.
         // No successor is submitted to the shim in this test.
